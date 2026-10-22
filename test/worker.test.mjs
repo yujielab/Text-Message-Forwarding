@@ -7,6 +7,8 @@ import {
   extractCode,
   messageFromEmail,
   verifyWebhookSignature,
+  webhookSignatureProblem,
+  webhookSecretState,
   recipientAllowed,
   normalizeSender,
   htmlToText,
@@ -135,4 +137,24 @@ test('Resend (Svix) webhook signature verification', async () => {
   assert.equal(await verifyWebhookSignature(body + ' ', headers(`v1,${sig}`), secret), false, 'tampered body');
   assert.equal(await verifyWebhookSignature(body, headers(`v1,${sig}`, String(Number(ts) - 3600)), secret), false, 'stale timestamp');
   assert.equal(await verifyWebhookSignature(body, new Headers(), secret), false, 'missing headers');
+});
+
+test('webhook signature failures are classified for diagnostics', async () => {
+  const key = crypto.randomBytes(24);
+  const secret = 'whsec_' + key.toString('base64');
+  const body = '{"type":"email.received"}';
+  const ts = String(Math.floor(Date.now() / 1000));
+  const sig = 'v1,' + crypto.createHmac('sha256', key).update(`m.${ts}.${body}`).digest('base64');
+  const h = (t = ts, s = sig) => new Headers({ 'svix-id': 'm', 'svix-timestamp': t, 'svix-signature': s });
+
+  assert.equal(await webhookSignatureProblem(body, h(), secret), '');
+  assert.equal(await webhookSignatureProblem(body, h(), ` ${secret}\n`), '', 'pasted secret with whitespace');
+  assert.equal(await webhookSignatureProblem(body, new Headers(), secret), 'missing_headers');
+  assert.equal(await webhookSignatureProblem(body, h(String(Number(ts) - 600)), secret), 'stale_timestamp');
+  assert.equal(await webhookSignatureProblem(body, h(), 'whsec_' + crypto.randomBytes(24).toString('base64')), 'signature_mismatch');
+  assert.equal(await webhookSignatureProblem(body, h(), 'whsec_###'), 'secret_not_base64');
+
+  assert.equal(webhookSecretState(secret), 'ok');
+  assert.equal(webhookSecretState(''), 'missing');
+  assert.equal(webhookSecretState('whsec_abc'), 'format');
 });

@@ -19,3 +19,7 @@ TZ_OFFSET = "+08:00"
 #   npx wrangler secret put RESEND_API_KEY         Resend API Key（读取邮件正文）
 #   npx wrangler secret put RESEND_WEBHOOK_SECRET  Resend Webhook 签名密钥 whsec_...
 #   npx wrangler secret put INGEST_TOKEN           可选：开启 /api/ingest 直接推送
+
+# 可选：每分钟从 Resend 收件箱补拉一次 Webhook 漏掉的邮件（打开网页时也会自动补拉）
+# [triggers]
+# crons = ["* * * * *"]
