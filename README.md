@@ -76,8 +76,9 @@ Safari 打开 Worker 地址 → 输入访问密码 → 分享 → **添加到主
 | 诊断结果 | 原因 | 处理 |
 | --- | --- | --- |
 | 无法读取 Resend 收件箱 · 401 | API Key 填错，或是只有发信权限的 Key | 在 Resend 新建 **Full access** 的 Key，更新 `RESEND_API_KEY` |
-| Resend 还没有收到任何邮件 | 域名没开启收信 / MX 记录未生效 / 手机发到了别的地址 | Resend → Domains 检查 Receiving 状态和 MX 记录 |
-| Resend 收到了邮件，但从没调用过 Webhook | Webhook 地址或事件不对，或 Endpoint 被 Resend 自动停用了 | 地址填诊断页里的「Webhook 地址」，勾选 `email.received`，确认 Endpoint 是启用状态 |
+| Resend 还没有收到任何邮件 | 手机发到了别的地址（`0901@cuven.us` 和 `…@0901.cuven.us` 是两个不同的域名） | 诊断页会显示开启收信的域名，手机要发到 `…@该域名` |
+| Webhook 已被停用 / 没有指向这里的 Webhook | 之前连续失败被 Resend 自动停用，或地址、事件填错 | 地址填诊断页里的「Webhook 地址」（填成根地址也可以），勾选 `email.received`，在 Resend 里重新启用 |
+| 没有开启收信的域名 / MX 未验证 | 域名没打开 Receiving，或 MX 记录没加在对应主机上 | 诊断页「Resend 设置」会列出每个域名的收信状态和实际 MX 记录 |
 | Webhook 签名校验失败 | `RESEND_WEBHOOK_SECRET` 和 Resend 后台的 Signing secret 不一致 | 重新复制 `whsec_...` |
 | N 封邮件还没入库 | Webhook 之前失败过（Resend 重试几次后就放弃了） | 点「从 Resend 导入」补上 |
 

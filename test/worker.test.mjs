@@ -12,6 +12,7 @@ import {
   recipientAllowed,
   normalizeSender,
   htmlToText,
+  secret,
 } from '../worker.js';
 
 const CN = 480; // +08:00
@@ -120,6 +121,9 @@ test('recipient filter', () => {
   assert.equal(recipientAllowed('other@cuven.us, 0901@CUVEN.us', data), true);
   assert.equal(recipientAllowed('@cuven.us', data), true);
   assert.equal(recipientAllowed('@0901.cuven.us', data), false);
+  assert.equal(recipientAllowed('cuven.us', data), true, 'bare domain rule');
+  assert.equal(recipientAllowed('0901.cuven.us', data), false, 'subdomain is a different domain');
+  assert.equal(recipientAllowed('0901.cuven.us', { to: ['a@0901.cuven.us'] }), true);
   assert.equal(recipientAllowed('someone@cuven.us', data), false);
 });
 
@@ -157,4 +161,11 @@ test('webhook signature failures are classified for diagnostics', async () => {
   assert.equal(webhookSecretState(secret), 'ok');
   assert.equal(webhookSecretState(''), 'missing');
   assert.equal(webhookSecretState('whsec_abc'), 'format');
+});
+
+test('secrets pasted with whitespace or quotes are normalized', () => {
+  assert.equal(secret({ K: '  re_abc\n' }, 'K'), 're_abc');
+  assert.equal(secret({ K: '"whsec_x+/="' }, 'K'), 'whsec_x+/=');
+  assert.equal(secret({ K: " 're_abc' " }, 'K'), 're_abc');
+  assert.equal(secret({}, 'K'), '');
 });
