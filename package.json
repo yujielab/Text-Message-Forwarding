@@ -1,0 +1,15 @@
+{
+  "name": "sms-inbox",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "短信转发收件箱：Resend Inbound → Cloudflare Worker + D1 → iOS 风格网页",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.151.3"
+  }
+}
