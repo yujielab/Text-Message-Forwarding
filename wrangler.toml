@@ -1,0 +1,21 @@
+name = "sms-inbox"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# 运行 `npx wrangler d1 create sms-inbox`，把输出的 database_id 填到下面
+[[d1_databases]]
+binding = "DB"
+database_name = "sms-inbox"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+[vars]
+# 只处理发往这些地址的邮件（逗号分隔；"@域名" 表示整个域）。留空 = 处理 Resend 收到的全部邮件
+INBOX = ""
+# 短信时间所在时区（「2026年10月22日 下午8:22」这类时间没有时区信息）
+TZ_OFFSET = "+08:00"
+
+# 以下用 secret 设置，不要写在这里：
+#   npx wrangler secret put ACCESS_PASSWORD        网页访问密码
+#   npx wrangler secret put RESEND_API_KEY         Resend API Key（读取邮件正文）
+#   npx wrangler secret put RESEND_WEBHOOK_SECRET  Resend Webhook 签名密钥 whsec_...
+#   npx wrangler secret put INGEST_TOKEN           可选：开启 /api/ingest 直接推送
