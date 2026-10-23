@@ -3,9 +3,12 @@
 一个 Cloudflare Worker（单文件 `worker.js`）：接收手机转发到邮箱的短信，用尽量还原 iOS「信息」App 的网页查看，验证码一键拷贝。
 
 ```
-手机短信 ──(邮件「内容/发件人/时间」)──▶ 0901@cuven.us ──▶ Resend Inbound
-        ──(email.received Webhook)──▶ Worker 校验签名、读取正文、解析 ──▶ D1 ──▶ 网页
+手机短信 ──(邮件「内容/发件人/时间」)──▶ 收件地址
+   ├─ 方式 A：Cloudflare 邮件路由「发送到 Worker」──────────────▶ Worker 解析 ──▶ D1 ──▶ 网页
+   └─ 方式 B：Resend Inbound ──(email.received Webhook)──▶ Worker 读取正文、解析 ──▶ D1
 ```
+
+两种方式可以只用一种，也可以同时用。域名已经在用 Cloudflare 邮件路由的话，方式 A 最简单，不需要 Resend。
 
 ## 功能
 
@@ -41,15 +44,24 @@ npx wrangler secret put RESEND_WEBHOOK_SECRET    # 第 4 步拿到的 whsec_...
 npm run deploy
 ```
 
-### 4. 配置 Resend 收信
+### 4A. 用 Cloudflare 邮件路由收信（不需要 Resend）
 
-1. **Domains → cuven.us → Receiving**：开启收信，按提示添加 MX 记录。
-   注意：如果 `cuven.us` 根域名已经在用别的邮箱（MX 记录会冲突），就在子域名上开启收信，例如 `0901.cuven.us`。
+1. Cloudflare 控制台 → 你的域名（如 `cuven.us`）→ **电子邮件 → 电子邮件路由**，确认已启用。
+2. **路由规则 → 创建地址**：自定义地址填 `0901`（即 `0901@cuven.us`），操作选 **发送到 Worker**，目标选这个 Worker。
+3. 手机把短信转发到 `0901@cuven.us` 即可，邮件会直接交给 Worker 解析入库。
+4. 可选：原来这个地址会转发到你的邮箱的话，设置 `FORWARD_TO`（必须是邮件路由里已验证的目标地址），Worker 存完后会再转发一份。
+
+用这种方式时，`RESEND_API_KEY` 和 `RESEND_WEBHOOK_SECRET` 可以不设置。
+
+### 4B. 用 Resend 收信
+
+1. **Domains → 添加域名 → Receiving**：开启收信，按提示添加 MX 记录。
+   注意：如果根域名已经在用别的邮箱或 Cloudflare 邮件路由（MX 指向 `route*.mx.cloudflare.net`），**不要**改根域名的 MX，那会弄坏现有邮箱；改在子域名上收信，例如在 Resend 添加 `0901.cuven.us`，给 `0901` 加 Resend 给出的 MX 记录，手机发到 `sms@0901.cuven.us`。
 2. **Webhooks → Add Endpoint**：
    - URL：`https://sms-inbox.<你的子域>.workers.dev/webhooks/resend`
    - 事件：勾选 `email.received`
    - 创建后复制 Signing Secret（`whsec_...`），执行 `npx wrangler secret put RESEND_WEBHOOK_SECRET`
-3. **收件地址过滤（可选）**：同一个 Resend 账号收到的所有邮件都会推给这个 Webhook，可以在 `wrangler.toml` 里限制：
+3. **收件地址过滤（可选，只对 Resend 生效）**：同一个 Resend 账号收到的所有邮件都会推给这个 Webhook，可以在 `wrangler.toml` 里限制：
    - 地址是 `0901@cuven.us` → `INBOX = "0901@cuven.us"`
    - 在子域 `0901.cuven.us` 收信 → `INBOX = "@0901.cuven.us"`
    - 留空则全部接收
@@ -76,6 +88,7 @@ Safari 打开 Worker 地址 → 输入访问密码 → 分享 → **添加到主
 | 诊断结果 | 原因 | 处理 |
 | --- | --- | --- |
 | 无法读取 Resend 收件箱 · 401 | API Key 填错，或是只有发信权限的 Key | 在 Resend 新建 **Full access** 的 Key，更新 `RESEND_API_KEY` |
+| 域名的邮件由 Cloudflare 邮件路由接收 | 根域名 MX 指向 `route*.mx.cloudflare.net`，邮件到不了 Resend | 用 4A 把地址「发送到 Worker」，或按 4B 改用子域名收信 |
 | Resend 还没有收到任何邮件 | 手机发到了别的地址（`0901@cuven.us` 和 `…@0901.cuven.us` 是两个不同的域名） | 诊断页会显示开启收信的域名，手机要发到 `…@该域名` |
 | Webhook 已被停用 / 没有指向这里的 Webhook | 之前连续失败被 Resend 自动停用，或地址、事件填错 | 地址填诊断页里的「Webhook 地址」（填成根地址也可以），勾选 `email.received`，在 Resend 里重新启用 |
 | 没有开启收信的域名 / MX 未验证 | 域名没打开 Receiving，或 MX 记录没加在对应主机上 | 诊断页「Resend 设置」会列出每个域名的收信状态和实际 MX 记录 |
@@ -88,7 +101,7 @@ Safari 打开 Worker 地址 → 输入访问密码 → 分享 → **添加到主
 
 ## 不用命令行部署
 
-Cloudflare 控制台 → Workers & Pages → 创建 Worker → 编辑代码，粘贴整个 `worker.js` → 部署。然后在 Worker 的 设置 → 绑定 里添加 D1 数据库（变量名 `DB`），在 变量和机密 里添加 `ACCESS_PASSWORD`、`RESEND_API_KEY`、`RESEND_WEBHOOK_SECRET`（以及可选的 `INBOX`、`TZ_OFFSET`）。
+Cloudflare 控制台 → Workers & Pages → 创建 Worker → 编辑代码，粘贴整个 `worker.js` → 部署。然后在 Worker 的 设置 → 绑定 里添加 D1 数据库（变量名 `DB`），在 变量和机密 里添加 `ACCESS_PASSWORD`；用 Resend 收信时再加 `RESEND_API_KEY`、`RESEND_WEBHOOK_SECRET`（以及可选的 `INBOX`、`TZ_OFFSET`、`FORWARD_TO`）。
 
 ## 可选：不经过邮件直接推送
 
