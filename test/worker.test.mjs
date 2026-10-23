@@ -14,6 +14,8 @@ import {
   normalizeSender,
   htmlToText,
   secret,
+  parseMime,
+  decodeMimeWords,
 } from '../worker.js';
 
 const CN = 480; // +08:00
@@ -203,4 +205,91 @@ test('diagnostics verdict trusts delivery evidence over setup heuristics', () =>
   // 最新一次是签名失败，且没有入库证据
   const sig = { ...base, resend: { ok: true, emails: [{ allowed: true, state: 'missing', to: 'a@x' }] }, webhooks: [{ result: 'invalid_signature', detail: 'signature_mismatch' }], setup: null };
   assert.equal(verdict(sig)[1], 'Webhook 签名校验失败');
+});
+
+// ---- Cloudflare Email Routing: MIME parsing ----
+const enc8 = (s) => new TextEncoder().encode(s.replace(/\n/g, '\r\n'));
+const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
+const SMS = '【招商银行】您账户8578于10月14日16:26完成扣款人民币13.05/+8615710653301/2026年10月22日 下午8:22';
+
+test('MIME: plain 8bit UTF-8 body, folded encoded-word subject split mid-character', () => {
+  const subjBytes = Buffer.from('短信通知', 'utf8');
+  // split the UTF-8 bytes across two encoded words in the middle of a character
+  const w1 = subjBytes.subarray(0, 4).toString('base64'), w2 = subjBytes.subarray(4).toString('base64');
+  const raw = enc8(`From: "SmsForwarder" <fwd@qq.com>\nTo: 0901@cuven.us\nSubject: =?UTF-8?B?${w1}?=\n =?UTF-8?B?${w2}?=\nMessage-ID: <abc123@qq.com>\nDate: Thu, 22 Oct 2026 20:22:00 +0800\nContent-Type: text/plain; charset=utf-8\nContent-Transfer-Encoding: 8bit\n\n${SMS}\n`);
+  const m = parseMime(raw);
+  assert.equal(m.subject, '短信通知');
+  assert.equal(m.text.trim(), SMS);
+  assert.equal(m.messageId, 'abc123@qq.com');
+  assert.equal(m.from, '"SmsForwarder" <fwd@qq.com>');
+  const rec = messageFromEmail({ text: m.text, subject: m.subject, from: m.from, created_at: m.date }, 480, Date.UTC(2026, 9, 23));
+  assert.equal(rec.sender, '+8615710653301');
+  assert.equal(rec.sentAt, Date.UTC(2026, 9, 22, 12, 22));
+});
+
+test('MIME: base64 body and Q-encoded subject', () => {
+  const raw = enc8(`Subject: =?utf-8?Q?=E9=AA=8C=E8=AF=81=E7=A0=81_test?=\nContent-Type: text/plain; charset="UTF-8"\nContent-Transfer-Encoding: base64\n\n${b64('【京东】验证码：482910/1069021112345/2026年10月22日 下午8:22').replace(/(.{40})/g, '$1\n')}\n`);
+  const m = parseMime(raw);
+  assert.equal(m.subject, '验证码 test');
+  assert.equal(extractCode(m.text), '482910');
+});
+
+test('MIME: multipart/alternative with quoted-printable text and html', () => {
+  const qp = Buffer.from('【支付宝】校验码 731905，请勿泄露。/95188/2026年10月22日 下午8:22', 'utf8');
+  let q = '';
+  for (const byte of qp) q += byte < 128 && byte !== 61 ? String.fromCharCode(byte) : '=' + byte.toString(16).toUpperCase().padStart(2, '0');
+  q = q.replace(/(.{60})/g, '$1=\n'); // soft line breaks
+  const raw = enc8(`Content-Type: multipart/alternative; boundary="b1"\n\n--b1\nContent-Type: text/plain; charset=utf-8\nContent-Transfer-Encoding: quoted-printable\n\n${q}\n--b1\nContent-Type: text/html; charset=utf-8\n\n<div>html version</div>\n--b1--\n`);
+  const m = parseMime(raw);
+  assert.equal(m.text.trim(), '【支付宝】校验码 731905，请勿泄露。/95188/2026年10月22日 下午8:22');
+  assert.equal(m.html.trim(), '<div>html version</div>');
+});
+
+test('MIME: nested multipart/mixed skips attachments; html-only falls back via messageFromEmail', () => {
+  const raw = enc8(`Content-Type: multipart/mixed; boundary=outer\n\n--outer\nContent-Type: multipart/alternative; boundary=inner\n\n--inner\nContent-Type: text/html; charset=utf-8\nContent-Transfer-Encoding: base64\n\n${b64('<p>【中国移动】话费账单</p><p>/10086/2026年10月21日 下午4:29</p>')}\n--inner--\n--outer\nContent-Type: text/plain; name=a.txt\nContent-Disposition: attachment; filename=a.txt\n\nnot the body\n--outer--\n`);
+  const m = parseMime(raw);
+  assert.equal(m.text, null);
+  const rec = messageFromEmail({ text: m.text, html: m.html }, 480, Date.UTC(2026, 9, 23));
+  assert.equal(rec.sender, '10086');
+  assert.equal(rec.body, '【中国移动】话费账单');
+});
+
+test('MIME: GBK charset (common with Chinese mail clients)', () => {
+  const gbk = Buffer.from([0xd1, 0xe9, 0xd6, 0xa4, 0xc2, 0xeb]); // 验证码 in GBK
+  const raw = enc8(`Subject: =?GBK?B?${gbk.toString('base64')}?=\nContent-Type: text/plain; charset=gb2312\nContent-Transfer-Encoding: base64\n\n${Buffer.concat([gbk, Buffer.from(' 123456/95555/2026-10-22 20:22')]).toString('base64')}\n`);
+  const m = parseMime(raw);
+  assert.equal(m.subject, '验证码');
+  assert.equal(m.text, '验证码 123456/95555/2026-10-22 20:22');
+});
+
+test('decodeMimeWords keeps plain text and unknown charsets readable', () => {
+  assert.equal(decodeMimeWords('Hello =?utf-8?B?5L2g5aW9?= world'), 'Hello 你好 world');
+  assert.equal(decodeMimeWords('no encoding here'), 'no encoding here');
+  assert.equal(decodeMimeWords('=?x-unknown?B?5L2g?='), new TextDecoder().decode(Buffer.from('5L2g', 'base64')));
+});
+
+test('diagnostics verdict: MX owned by Cloudflare Email Routing, and Cloudflare-only setups', () => {
+  const verdict = loadVerdict();
+  const base = { config: { apiKey: 'ok', webhookSecret: 'ok', inbox: '', webhookUrl: 'https://sms.cuven.us/webhooks/resend' }, messages: 0 };
+  // 用户截图里的情况：Resend 一封没收到，cuven.us 的 MX 指向 Cloudflare，日志里只有 domain.* 事件
+  const screenshot = {
+    ...base,
+    resend: { ok: true, emails: [] },
+    webhooks: [{ status: 200, result: 'ignored_event', detail: 'domain.updated' }, { status: 200, result: 'ignored_event', detail: 'domain.created' }],
+    setup: {
+      webhooks: { ok: true, items: [{ endpoint: 'https://sms.cuven.us/', matches: true, status: 'enabled', events: null }] },
+      domains: { ok: true, items: [{ name: 'cuven.us', receiving: 'enabled', mxRecord: { status: 'pending' }, dns: [{ priority: 11, host: 'route1.mx.cloudflare.net' }, { priority: 18, host: 'route2.mx.cloudflare.net' }] }] },
+    },
+  };
+  const v = verdict(screenshot);
+  assert.equal(v[1], 'cuven.us 的邮件由 Cloudflare 邮件路由接收');
+  assert.ok(!/优先级数字要最小/.test(v[2]), 'must not advise taking over the root MX');
+  // 邮件路由已经送到 Worker
+  assert.equal(verdict({ ...screenshot, webhooks: [{ status: 0, result: 'email_stored' }, ...screenshot.webhooks] })[0], 'ok');
+  // 只用 Cloudflare、没配 Resend
+  const cfOnly = { config: { apiKey: 'missing', webhookSecret: 'missing', inbox: '' }, resend: null, setup: null, messages: 0 };
+  assert.equal(verdict({ ...cfOnly, webhooks: [] })[1], '还没有收到过邮件');
+  assert.equal(verdict({ ...cfOnly, webhooks: [{ status: 0, result: 'email_stored' }] })[0], 'ok');
+  // Resend 只配了一半
+  assert.equal(verdict({ ...cfOnly, config: { ...cfOnly.config, webhookSecret: 'ok' }, webhooks: [] })[1], 'RESEND_API_KEY 未设置');
 });
