@@ -90,8 +90,8 @@ async function handle(request, env, ctx) {
   if (pathname === '/' && (method === 'GET' || method === 'HEAD')) return authed ? appPage(env) : loginPage();
   if (pathname.startsWith('/api/')) {
     if (!authed) return json({ error: 'unauthorized' }, 401);
-    // 简单 CSRF 防护：写操作必须带自定义请求头（跨站表单无法设置）
-    if (method !== 'GET' && request.headers.get('X-Requested-With') !== 'fetch') return json({ error: 'forbidden' }, 403);
+    // 简单 CSRF 防护：所有接口都要带自定义请求头（跨站表单和跳转都带不上）
+    if (request.headers.get('X-Requested-With') !== 'fetch') return json({ error: 'forbidden' }, 403);
     return handleApi(request, env, url);
   }
   return new Response('Not found', { status: 404, headers: SECURITY_HEADERS });
@@ -161,7 +161,7 @@ const LATEST_CODE_SQL = `
   WHERE code IS NOT NULL ORDER BY received_at DESC, id DESC LIMIT 1`;
 const MESSAGE_COLUMNS = 'id, body, code, sent_at AS ts, received_at AS rx';
 
-async function insertMessage(db, record, emailId) {
+async function insertMessage(db, record, emailId, receivedAt = Date.now()) {
   const id = emailId || null;
   const [insert] = await db.batch([
     db
@@ -169,7 +169,7 @@ async function insertMessage(db, record, emailId) {
         `INSERT OR IGNORE INTO messages (email_id, sender, body, code, sent_at, raw_time, received_at)
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE NOT EXISTS (SELECT 1 FROM deleted_emails WHERE email_id = ?1)`,
       )
-      .bind(id, record.sender, record.body, record.code || null, record.sentAt, record.rawTime || null, Date.now()),
+      .bind(id, record.sender, record.body, record.code || null, record.sentAt, record.rawTime || null, receivedAt),
     db.prepare(BUMP_VERSION_SQL),
   ]);
   return insert.meta.changes > 0;
@@ -275,41 +275,72 @@ async function storeReceivedEmail(env, meta) {
     email = { ...meta, ...(await res.json()) };
   }
   const record = messageFromEmail(email, parseTzOffset(env.TZ_OFFSET));
-  const inserted = await insertMessage(env.DB, record, emailId);
+  // 用 Resend 收到邮件的时间：补拉或 Webhook 重试时，旧验证码不能显示成「刚刚」
+  const receivedAt = Math.min(Date.now(), Date.parse(email.created_at || '') || Date.now());
+  const inserted = await insertMessage(env.DB, record, emailId, receivedAt);
   return { status: 200, result: inserted ? 'stored' : 'duplicate', detail: record.sender };
 }
 
 async function logWebhook(db, outcome) {
+  const now = Date.now();
+  // 签名错误的请求谁都能发：每分钟最多记一条，免得被刷爆 D1 写入或冲掉真实记录
+  const throttle = outcome.result === 'invalid_signature' ? now - 60000 : now + 1;
   await db.batch([
     db
-      .prepare('INSERT INTO webhook_log (at, status, result, detail, email_id) VALUES (?, ?, ?, ?, ?)')
-      .bind(Date.now(), outcome.status, outcome.result, String(outcome.detail || '').slice(0, 300), outcome.emailId || null),
+      .prepare(
+        `INSERT INTO webhook_log (at, status, result, detail, email_id) SELECT ?1, ?2, ?3, ?4, ?5
+         WHERE NOT EXISTS (SELECT 1 FROM webhook_log WHERE result = ?3 AND at > ?6)`,
+      )
+      .bind(now, outcome.status, outcome.result, String(outcome.detail || '').slice(0, 300), outcome.emailId || null, throttle),
     db.prepare('DELETE FROM webhook_log WHERE id <= (SELECT MAX(id) FROM webhook_log) - ?').bind(WEBHOOK_LOG_KEEP),
   ]);
 }
 
-// 从 Resend 收件箱补拉 Webhook 没送达的邮件（已入库或已删除的跳过）
-async function importFromResend(env, limit = IMPORT_LIMIT) {
+// 从 Resend 收件箱补拉 Webhook 没送达的邮件（已入库或已删除的跳过）。
+// 平时只看最新一页；手动导入会往前翻页。每次请求最多读 maxFetch 封正文（Workers 子请求有上限），
+// 没读完时返回 more: true，由前端接着再调。
+async function importFromResend(env, { pageSize = IMPORT_LIMIT, maxPages = 1, maxFetch = 10 } = {}) {
   if (!secret(env, 'RESEND_API_KEY')) return { ok: false, error: 'RESEND_API_KEY 未设置' };
-  const res = await resendGet(env, `/emails/receiving?limit=${limit}`);
-  if (!res.ok) return { ok: false, error: await resendError(res) };
-  const emails = ((await res.json()).data || []).filter((e) => e && e.id);
-  const known = await knownEmailIds(env.DB, emails.map((e) => e.id));
-  const result = { ok: true, checked: emails.length, imported: 0, skipped: 0, errors: [] };
+  const result = { ok: true, checked: 0, imported: 0, skipped: 0, errors: [], more: false };
+  const seen = new Set();
+  let after = '';
   let fetched = 0;
-  for (const email of emails.slice().reverse()) {
-    if (known.has(email.id)) continue;
-    if (!recipientAllowed(env.INBOX, email)) {
-      result.skipped++;
-      continue;
+  pages: for (let page = 0; page < maxPages; page++) {
+    const res = await resendGet(env, `/emails/receiving?limit=${pageSize}${after ? `&after=${encodeURIComponent(after)}` : ''}`);
+    if (!res.ok) {
+      if (!page) return { ok: false, error: await resendError(res) };
+      result.errors.push(await resendError(res));
+      break;
     }
-    if (fetched++) await sleep(300); // 别撞上 Resend 的团队限流
-    const stored = await storeReceivedEmail(env, { ...email, email_id: email.id });
-    if (stored.result === 'stored') result.imported++;
-    else if (stored.status >= 400) {
-      result.errors.push(stored.detail);
-      if (/^429\b/.test(stored.detail)) break; // 剩下的留给下次补拉
+    const list = await res.json();
+    const emails = (list.data || []).filter((e) => e && e.id && !seen.has(e.id));
+    if (!emails.length) break;
+    emails.forEach((e) => seen.add(e.id));
+    result.checked += emails.length;
+    const known = await knownEmailIds(env.DB, emails.map((e) => e.id));
+    for (const email of emails.slice().reverse()) {
+      if (known.has(email.id)) continue;
+      if (!recipientAllowed(env.INBOX, email)) {
+        result.skipped++;
+        continue;
+      }
+      if (fetched >= maxFetch) {
+        result.more = true;
+        break pages;
+      }
+      if (fetched++) await sleep(300); // 别撞上 Resend 的团队限流
+      const stored = await storeReceivedEmail(env, { ...email, email_id: email.id });
+      if (stored.result === 'stored') result.imported++;
+      else if (stored.status >= 400) {
+        result.errors.push(stored.detail);
+        if (/^429\b/.test(stored.detail)) {
+          result.more = true; // 剩下的留给下次补拉
+          break pages;
+        }
+      }
     }
+    if (!list.has_more) break;
+    after = emails[emails.length - 1].id;
   }
   return result;
 }
@@ -332,13 +363,12 @@ async function knownEmailIds(db, ids) {
 async function throttledImport(env, force) {
   const db = env.DB;
   const now = Date.now();
-  if (!force) {
-    const claim = await db
-      .prepare("INSERT INTO meta (k, v) VALUES ('last_import', ?1) ON CONFLICT(k) DO UPDATE SET v = ?1 WHERE v < ?2")
-      .bind(now, now - IMPORT_THROTTLE_MS)
-      .run();
-    if (!claim.meta.changes) return { ok: true, throttled: true, imported: 0 };
-  }
+  if (force) return importFromResend(env, { pageSize: 100, maxPages: 10, maxFetch: 25 });
+  const claim = await db
+    .prepare("INSERT INTO meta (k, v) VALUES ('last_import', ?1) ON CONFLICT(k) DO UPDATE SET v = ?1 WHERE v < ?2")
+    .bind(now, now - IMPORT_THROTTLE_MS)
+    .run();
+  if (!claim.meta.changes) return { ok: true, throttled: true, imported: 0 };
   return importFromResend(env);
 }
 
@@ -355,7 +385,10 @@ async function diagnostics(env, origin) {
   let setup = null;
   if (config.apiKey !== 'missing') {
     const res = await resendGet(env, '/emails/receiving?limit=10');
-    setup = await resendSetup(env, origin);
+    setup = await resendSetup(env, origin).catch((err) => {
+      const error = String((err && err.message) || err);
+      return { webhooks: { ok: false, error }, domains: { ok: false, error } };
+    });
     if (res.ok) {
       const emails = ((await res.json()).data || []).filter((e) => e && e.id);
       const known = await knownEmailIds(db, emails.map((e) => e.id));
@@ -365,7 +398,8 @@ async function diagnostics(env, origin) {
           id: e.id,
           to: recipientsOf(e).join(', '),
           from: displayFrom(e.from),
-          subject: e.subject || '',
+          // INBOX 之外的邮件只显示收件人，不显示主题
+          subject: recipientAllowed(env.INBOX, e) ? e.subject || '' : '',
           at: Date.parse(e.created_at || '') || null,
           state: known.get(e.id) || 'missing',
           allowed: recipientAllowed(env.INBOX, e),
@@ -395,7 +429,7 @@ async function resendSetup(env, origin) {
             url = new URL(w.endpoint);
           } catch {}
           return {
-            endpoint: w.endpoint,
+            endpoint: url ? url.origin + url.pathname : String(w.endpoint || ''),
             status: w.status,
             events: w.events,
             matches: !!url && (url.host === ownHost || url.pathname === '/webhooks/resend'),
@@ -414,7 +448,7 @@ async function resendSetup(env, origin) {
       const mx = records.find((r) => r.record === 'Receiving');
       items.push({
         name: d.name,
-        receiving: (detail.ok ? detail.data.capabilities : d.capabilities || {}).receiving || 'disabled',
+        receiving: ((detail.ok && detail.data.capabilities) || d.capabilities || {}).receiving || 'disabled',
         mxRecord: mx ? { status: mx.status, value: mx.value, priority: mx.priority } : null,
         dns: await lookupMx(d.name),
       });
@@ -1728,7 +1762,9 @@ function api(path, body) {
 
 /* ---------- island toast ---------- */
 var islandTimer = 0;
-function toast(title, detail) {
+// 失败时用红色图标，免得「导入失败」配着绿色对勾
+function toast(title, detail, failed) {
+  islandEl.querySelector('.island-icon').innerHTML = failed ? ICONS.stBad : ICONS.check;
   $('islandTitle').textContent = title;
   $('islandDetail').textContent = detail || '';
   islandEl.classList.remove('show');
@@ -1751,9 +1787,9 @@ function fallbackCopy(text) {
 function copyText(text, title) {
   function done() { haptic(); toast(title || '已拷贝', text.length > 24 ? text.slice(0, 24) + '…' : text); }
   if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(text).then(done, function () { if (fallbackCopy(text)) done(); else toast('无法拷贝'); });
+    navigator.clipboard.writeText(text).then(done, function () { if (fallbackCopy(text)) done(); else toast('无法拷贝', '', true); });
   } else if (fallbackCopy(text)) done();
-  else toast('无法拷贝');
+  else toast('无法拷贝', '', true);
 }
 
 /* ---------- conversation list ---------- */
@@ -1984,7 +2020,7 @@ function deleteThread(sender) {
     if (isSplit()) { S.current = null; history.replaceState(null, '', '#/'); renderThreadState(); }
     else goBack();
   }
-  api('/api/delete', { sender: sender }).then(refreshSoon, function () { toast('删除失败'); refreshSoon(); });
+  api('/api/delete', { sender: sender }).then(refreshSoon, function () { toast('删除失败', '', true); refreshSoon(); });
 }
 
 function toggleRead(t) {
@@ -2581,7 +2617,7 @@ function deleteMessage(m) {
       if (!S.messages.length) deleteThreadLocal(sender);
     }
     if (row) collapse(row, finish); else finish();
-    api('/api/delete', { id: m.id }).then(refreshSoon, function () { toast('删除失败'); refreshSoon(); });
+    api('/api/delete', { id: m.id }).then(refreshSoon, function () { toast('删除失败', '', true); refreshSoon(); });
   });
 }
 function deleteThreadLocal(sender) {
@@ -2759,38 +2795,49 @@ var DETAIL_TEXT = {
 function stamp(ts) { return ts ? listTime(ts) + (daysAgo(ts) > 0 ? ' ' + clock(ts) : '') : ''; }
 function verdict(d) {
   var c = d.config, r = d.resend, w = d.webhooks || [], last = w[0];
+  var setup = d.setup || {}, sw = setup.webhooks, sd = setup.domains;
   if (c.apiKey === 'missing') return ['bad', 'RESEND_API_KEY 未设置', 'Worker 需要用它读取邮件正文。'];
   if (c.webhookSecret !== 'ok') return ['bad', 'Webhook 签名密钥有问题', '在 Resend → Webhooks → 你的 Endpoint 里复制 Signing secret（whsec_…），填到 RESEND_WEBHOOK_SECRET。'];
   if (r && !r.ok) return ['bad', '无法读取 Resend 收件箱', r.error + '。API Key 需要 Full access 权限；401 表示 Key 填错或已删除。'];
-  var setup = d.setup || {}, sw = setup.webhooks, sd = setup.domains;
+  var emails = r && r.ok ? r.emails : [];
+  var allowed = emails.filter(function (e) { return e.allowed; });
+  var missing = allowed.filter(function (e) { return e.state === 'missing'; }).length;
+  // 先看实际效果：最新一封邮件已入库（或最近一次 Webhook 存进去了）就说明链路是通的，不再拿配置推测吓人
+  var delivering = allowed.length ? allowed[0].state !== 'missing' : !!last && (last.result === 'stored' || last.result === 'duplicate');
+  if (delivering) {
+    return missing
+      ? ['warn', missing + ' 封较早的邮件还没入库', '新邮件已经能正常到达。点下方「从 Resend 导入」把之前漏掉的补上。']
+      : ['ok', '一切正常', '共 ' + d.messages + ' 条信息。新短信会通过 Webhook 实时到达。'];
+  }
   if (sw && sw.ok) {
+    var subscribed = function (x) { return x.status === 'enabled' && (!x.events || x.events.indexOf('email.received') >= 0); };
     var mine = sw.items.filter(function (x) { return x.matches; });
-    var live = mine.filter(function (x) { return x.status === 'enabled' && (!x.events || x.events.indexOf('email.received') >= 0); });
-    if (!mine.length) return ['bad', 'Resend 里没有指向这里的 Webhook', '在 Resend → Webhooks 添加 ' + c.webhookUrl + '，事件勾选 email.received。'];
-    if (!live.length) {
+    if (!mine.length) {
+      return sw.items.some(subscribed)
+        ? ['warn', 'Webhook 地址和当前网址不同', '如果它也指向这个 Worker 可以忽略；否则在 Resend → Webhooks 添加 ' + c.webhookUrl + '。']
+        : ['bad', 'Resend 里没有指向这里的 Webhook', '在 Resend → Webhooks 添加 ' + c.webhookUrl + '，事件勾选 email.received。'];
+    }
+    if (!mine.some(subscribed)) {
       return mine.some(function (x) { return x.status !== 'enabled'; })
         ? ['bad', 'Webhook 已被停用', '多半是之前连续失败被 Resend 自动停用了。在 Resend → Webhooks 里重新启用，然后点「从 Resend 导入」补回漏掉的。']
         : ['bad', 'Webhook 没有订阅 email.received', '在 Resend → Webhooks 编辑这个 Endpoint，勾选 email.received 事件。'];
     }
   }
-  if (sd && sd.ok) {
-    var recv = sd.items.filter(function (x) { return x.receiving === 'enabled'; });
-    if (!recv.length) return ['bad', '没有开启收信的域名', 'Resend → Domains → 选择域名 → 打开 Receiving，并按提示添加 MX 记录。'];
-    if (recv.every(function (x) { return x.mxRecord && x.mxRecord.status !== 'verified'; })) {
+  if (r && r.ok && !emails.length) {
+    var recv = sd && sd.ok ? sd.items.filter(function (x) { return x.receiving === 'enabled'; }) : null;
+    if (recv && !recv.length) return ['bad', '没有开启收信的域名', 'Resend → Domains → 选择域名 → 打开 Receiving，并按提示添加 MX 记录。'];
+    if (recv && recv.every(function (x) { return x.mxRecord && x.mxRecord.status !== 'verified'; })) {
       return ['warn', '收信 MX 记录还没验证通过', '把 Resend 给出的 MX 记录添加到 ' + recv[0].name + '，且优先级数字要最小，然后等 DNS 生效。'];
     }
-  }
-  if (last && last.result === 'invalid_signature') return ['bad', 'Webhook 签名校验失败', (DETAIL_TEXT[last.detail] || last.detail) + '。'];
-  if (last && last.result === 'resend_api_error') return ['bad', '读取邮件正文失败', last.detail];
-  if (r && r.ok && !r.emails.length) {
-    var hosts = sd && sd.ok ? sd.items.filter(function (x) { return x.receiving === 'enabled'; }).map(function (x) { return '…@' + x.name; }) : [];
+    var hosts = (recv || []).map(function (x) { return '…@' + x.name; });
     return ['warn', 'Resend 还没有收到任何邮件', hosts.length
       ? '手机要转发到 ' + hosts.join(' 或 ') + ' 这样的地址（注意 0901@cuven.us 和 …@0901.cuven.us 是不同的域名）。'
       : '检查 Resend → Domains 里的收信设置，以及手机转发的收件地址。'];
   }
-  if (r && r.ok && r.emails.every(function (e) { return !e.allowed; })) return ['warn', 'INBOX 过滤挡掉了所有邮件', '当前 INBOX = ' + c.inbox + '，而邮件发往 ' + r.emails[0].to + '。清空 INBOX 或改成实际地址。'];
-  if (r && r.ok && !w.length) return ['warn', 'Resend 收到了邮件，但从没调用过 Webhook', '在 Resend → Webhooks 添加下面的 Webhook 地址并勾选 email.received。可以先点「从 Resend 导入」。'];
-  var missing = r && r.ok ? r.emails.filter(function (e) { return e.allowed && e.state === 'missing'; }).length : 0;
+  if (last && last.result === 'invalid_signature') return ['bad', 'Webhook 签名校验失败', (DETAIL_TEXT[last.detail] || last.detail) + '。'];
+  if (last && last.result === 'resend_api_error') return ['bad', '读取邮件正文失败', last.detail];
+  if (emails.length && !allowed.length) return ['warn', 'INBOX 过滤挡掉了所有邮件', '当前 INBOX = ' + c.inbox + '，而邮件发往 ' + emails[0].to + '。清空 INBOX 或改成实际地址。'];
+  if (!w.length) return ['warn', 'Resend 收到了邮件，但从没调用过 Webhook', '在 Resend → Webhooks 添加下面的 Webhook 地址并勾选 email.received。可以先点「从 Resend 导入」。'];
   if (missing) return ['warn', missing + ' 封邮件还没入库', '点下方「从 Resend 导入」补上。'];
   return ['ok', '一切正常', '共 ' + d.messages + ' 条信息。新短信会通过 Webhook 实时到达。'];
 }
@@ -2815,7 +2862,10 @@ function gSection(body, head, rows, foot) {
   body.appendChild(g);
   if (foot) body.appendChild(el('div', 'g-foot', foot));
 }
+var diagOpen = false;
 function openDiagnostics() {
+  if (diagOpen) return;
+  diagOpen = true;
   closeMenu(true);
   var layer = el('div', 'page-layer'), scrim = el('div', 'page-scrim'), sheet = el('div', 'page-sheet');
   sheet.setAttribute('role', 'dialog'); sheet.setAttribute('aria-modal', 'true'); sheet.setAttribute('aria-label', '连接诊断');
@@ -2832,17 +2882,30 @@ function openDiagnostics() {
   requestAnimationFrame(function () { layer.classList.add('open'); sp.to(0, { response: 0.45, damping: 1 }); });
 
   var prev = document.activeElement, closed = false;
+  app.inert = true; // 表单打开时，后面的页面不可聚焦、不可点
   done.focus({ preventScroll: true });
   function close(v) {
     if (closed) return;
     closed = true;
+    diagOpen = false;
+    app.inert = false;
     document.removeEventListener('keydown', onKey, true);
     layer.classList.remove('open');
     layer.style.pointerEvents = 'none';
     sp.to(sheet.offsetHeight + 40, { response: 0.35, damping: 1, velocity: v || 0 }, function () { layer.remove(); });
     if (prev && prev.focus && document.contains(prev)) prev.focus({ preventScroll: true });
   }
-  function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(0); } }
+  function onKey(e) {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(0); return; }
+    if (e.key === 'Tab') {
+      var items = Array.prototype.slice.call(sheet.querySelectorAll('button:not(:disabled)'));
+      var i = items.indexOf(document.activeElement);
+      e.preventDefault();
+      if (items.length) items[(i + (e.shiftKey ? -1 : 1) + items.length) % items.length].focus();
+      return;
+    }
+    e.stopPropagation(); // 别触发列表页的快捷键
+  }
   document.addEventListener('keydown', onKey, true);
   done.addEventListener('click', function () { close(0); });
   scrim.addEventListener('click', function () { close(0); });
@@ -2923,12 +2986,26 @@ function openDiagnostics() {
       imp.type = 'button';
       imp.addEventListener('click', function () {
         imp.disabled = true; imp.textContent = '正在导入…';
-        api('/api/import', { force: true }).then(function (res) {
-          if (!res.ok) toast('导入失败', res.error);
-          else toast(res.imported ? '已导入 ' + res.imported + ' 条' : '没有需要导入的邮件', res.errors && res.errors.length ? res.errors[0] : '');
+        var total = 0, rounds = 0, errors = [];
+        // 一次请求最多补 25 封，没补完（more）就接着要
+        (function step() {
+          api('/api/import', { force: true }).then(function (res) {
+            if (!res.ok) { done(res.error); return; }
+            total += res.imported || 0;
+            errors = errors.concat(res.errors || []);
+            imp.textContent = '正在导入…（已导入 ' + total + ' 条）';
+            if (res.more && (res.imported || !errors.length) && ++rounds < 40) step();
+            else done();
+          }, function (err) { done(err.message); });
+        })();
+        function done(failure) {
+          if (failure) toast('导入失败', failure, true);
+          else if (total) toast('已导入 ' + total + ' 条', errors[0] || '');
+          else if (errors.length) toast('导入失败', errors[0], true);
+          else toast('没有需要导入的邮件');
           refreshSoon();
           load();
-        }, function (err) { toast('导入失败', err.message); load(); });
+        }
       });
       inbox.push(imp);
     }

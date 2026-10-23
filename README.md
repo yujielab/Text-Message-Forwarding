@@ -82,9 +82,9 @@ Safari 打开 Worker 地址 → 输入访问密码 → 分享 → **添加到主
 | Webhook 签名校验失败 | `RESEND_WEBHOOK_SECRET` 和 Resend 后台的 Signing secret 不一致 | 重新复制 `whsec_...` |
 | N 封邮件还没入库 | Webhook 之前失败过（Resend 重试几次后就放弃了） | 点「从 Resend 导入」补上 |
 
-> 1.1 之前的版本请求 Resend API 时没有带 `User-Agent`，在线上会被 Resend 以 403（error 1010）拒绝，导致所有邮件都存不进来。升级后点一次「从 Resend 导入」即可把之前漏掉的补回来。
+> 1.1 之前的版本请求 Resend API 时没有带 `User-Agent`，在线上会被 Resend 以 403（error 1010）拒绝，导致所有邮件都存不进来。升级后点「从 Resend 导入」，它会往前翻页，把 Resend 还保存着的邮件都补回来（每次最多 25 封，没补完会自动接着补；导入的信息保留邮件原本的接收时间，旧验证码不会被当成新的）。
 
-另外，打开网页时会自动向 Resend 补拉一次漏掉的邮件；想在不打开网页时也自动补拉，可以在 `wrangler.toml` 里打开每分钟一次的 Cron Trigger。
+另外，打开网页时会自动向 Resend 补拉一次最新邮件里漏掉的（20 秒内只拉一次）；想在不打开网页时也自动补拉，可以在 `wrangler.toml` 里打开每分钟一次的 Cron Trigger。
 
 ## 不用命令行部署
 
