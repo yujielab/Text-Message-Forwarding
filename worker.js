@@ -1365,6 +1365,7 @@ const ICONS = {
 function appBody() {
   return `<div id="app" class="app">
   <section id="listPane" class="pane list-pane" aria-label="信息">
+    <div id="paneDim" class="pane-dim" aria-hidden="true"></div>
     <header class="topbar">
       <div class="edge"></div>
       <div class="bar">
@@ -1379,7 +1380,7 @@ function appBody() {
         <label class="search-field">${ICONS.search}<input id="search" type="search" placeholder="搜索" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="search" aria-label="搜索信息"><button id="searchClear" class="search-clear" type="button" aria-label="清除" hidden>${ICONS.xmarkFill}</button></label>
         <button id="searchCancel" class="search-cancel" type="button">取消</button>
       </div>
-      <div id="codeCard" class="code-card glass" hidden>
+      <div id="codeCard" class="code-card" hidden>
         <button id="codeOpen" class="code-head" type="button"><span class="code-app">${ICONS.appIcon}</span><span id="codeFrom" class="code-from"></span><span id="codeAgo" class="code-ago"></span></button>
         <div class="code-row">
           <button id="codeValue" class="code-value" type="button"></button>
@@ -1431,7 +1432,7 @@ const BASE_CSS = String.raw`
   --bg:#fff;--bg-2:#f2f2f7;--label:#000;--label-2:rgba(60,60,67,.6);--label-3:rgba(60,60,67,.3);
   --sep:rgba(60,60,67,.29);--fill:rgba(118,118,128,.12);--press:#d1d1d6;--hover:rgba(0,0,0,.035);
   --blue:#007aff;--red:#ff3b30;--green:#34c759;--orange:#ff9500;
-  --page:#f2f2f7;--cell:#fff;
+  --page:#f2f2f7;--cell:#fff;--card:#fff;
   --bubble:#e9e9eb;--bubble-hl:#d1d1d6;
   --avatar:linear-gradient(180deg,#a5abb9,#858994);
   --glass:rgba(255,255,255,.6);--glass-solid:#f7f7f8;--glass-rim:rgba(255,255,255,.95);--glass-line:rgba(0,0,0,.07);
@@ -1447,7 +1448,7 @@ const BASE_CSS = String.raw`
   --bg:#000;--bg-2:#1c1c1e;--label:#fff;--label-2:rgba(235,235,245,.6);--label-3:rgba(235,235,245,.3);
   --sep:rgba(84,84,88,.6);--fill:rgba(118,118,128,.24);--press:#2c2c2e;--hover:rgba(255,255,255,.05);
   --blue:#0a84ff;--red:#ff453a;--green:#30d158;--orange:#ff9f0a;
-  --page:#1c1c1e;--cell:#2c2c2e;
+  --page:#1c1c1e;--cell:#2c2c2e;--card:#1c1c1e;
   --bubble:#262628;--bubble-hl:#3a3a3c;
   --avatar:linear-gradient(180deg,#6e6e73,#48484a);
   --glass:rgba(40,40,43,.55);--glass-solid:#1c1c1e;--glass-rim:rgba(255,255,255,.16);--glass-line:rgba(255,255,255,.08);
@@ -1477,7 +1478,9 @@ const APP_CSS = String.raw`
 .app{position:fixed;inset:0;overflow:hidden;background:var(--bg)}
 .pane{position:absolute;inset:0;display:flex;flex-direction:column;background:var(--bg);overflow:hidden}
 .scroller{flex:1;min-height:0;overflow-x:hidden;overflow-y:auto;overscroll-behavior-y:contain;-webkit-overflow-scrolling:touch}
-.list-pane::after{content:"";position:absolute;inset:0;z-index:10;background:#000;opacity:var(--dim,0);pointer-events:none}
+/* 推入对话时列表变暗：单独一层，只改它的 opacity，不触发整页样式重算 */
+.pane-dim{position:absolute;inset:0;z-index:10;background:#000;opacity:0;pointer-events:none;will-change:opacity}
+.app:not(.split) .list-pane,.app:not(.split) .thread-pane{will-change:transform}
 
 /* 顶部浮动控件 + 滚动边缘效果 */
 .topbar{position:absolute;z-index:4;top:0;left:0;right:0;padding-top:env(safe-area-inset-top);pointer-events:none}
@@ -1533,7 +1536,8 @@ const APP_CSS = String.raw`
 .list-pane:not(.has-query) #results{display:none}
 
 /* 验证码卡片 */
-.code-card{margin:2px 16px 14px;padding:12px 14px 14px 16px;border-radius:26px}
+/* 卡片跟着列表滚动、背后是纯色，不用毛玻璃（滚动时每帧重新模糊很费） */
+.code-card{margin:2px 16px 14px;padding:12px 14px 14px 16px;border-radius:26px;background:var(--card);box-shadow:inset 0 0 0 .5px var(--glass-line),0 1px 3px rgba(0,0,0,.05),0 6px 24px rgba(0,0,0,.07)}
 .code-head{display:flex;align-items:center;gap:8px;width:100%;text-align:left;min-height:28px}
 .code-app .app{fill:var(--green)}
 .code-from{flex:1;min-width:0;font-size:.882rem;font-weight:600;letter-spacing:-.016em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1551,7 +1555,7 @@ const APP_CSS = String.raw`
 .empty-text{margin-top:6px;font-size:.882rem;line-height:1.333;max-width:20em;letter-spacing:-.016em;overflow-wrap:anywhere}
 
 /* 对话 */
-.app:not(.split) .thread-pane{will-change:transform;box-shadow:-10px 0 30px rgba(0,0,0,.1)}
+.app:not(.split) .thread-pane{box-shadow:-10px 0 30px rgba(0,0,0,.1)}
 .thread-top .bar{height:88px;align-items:flex-start;padding-top:6px}
 .back{gap:3px;padding:0 13px 0 15px;margin-top:6px}
 .back-badge{font-size:.882rem;font-weight:600;letter-spacing:-.016em;font-variant-numeric:tabular-nums}
@@ -1563,7 +1567,7 @@ const APP_CSS = String.raw`
 .peer-name svg{flex:none;color:var(--label-3)}
 .thread-scroll{padding-top:calc(env(safe-area-inset-top) + 98px);padding-bottom:calc(env(safe-area-inset-bottom) + 20px);touch-action:pan-y pinch-zoom}
 .thread-pane.has-quick .thread-scroll{padding-bottom:calc(env(safe-area-inset-bottom) + 92px)}
-.bubbles{position:relative;padding:0 16px;--reveal:0px;--reveal-o:0}
+.bubbles{position:relative;padding:0 16px}
 .thread-intro{text-align:center;font-size:.706rem;line-height:1.333;font-weight:500;color:var(--label-2);margin:2px 0 0}
 .ts{text-align:center;font-size:.706rem;line-height:1.333;color:var(--label-2);margin:14px 0 6px;letter-spacing:0}
 .ts b{font-weight:600}
@@ -1577,7 +1581,9 @@ const APP_CSS = String.raw`
 @keyframes flash{15%,55%{background-color:var(--bubble-hl)}}
 .msg.in .bubble{animation:msg-in .5s var(--ease) both;transform-origin:0 100%}
 @keyframes msg-in{from{opacity:0;transform:translateY(10px) scale(.9)}}
-.msg-time{position:absolute;right:-16px;top:50%;width:76px;padding-right:16px;text-align:right;font-size:.706rem;letter-spacing:0;color:var(--label-2);font-variant-numeric:tabular-nums;white-space:nowrap;transform:translate(calc(76px + var(--reveal)),-50%);opacity:var(--reveal-o);pointer-events:none}
+/* 左滑看时间：所有时间放在同一层，整层平移，拖动时只改一个元素的 transform */
+.time-rail{position:absolute;top:0;bottom:0;right:-16px;width:76px;pointer-events:none;opacity:0;transform:translate3d(76px,0,0);will-change:transform,opacity}
+.time-rail span{position:absolute;right:16px;font-size:.706rem;letter-spacing:0;color:var(--label-2);font-variant-numeric:tabular-nums;white-space:nowrap;transform:translateY(-50%)}
 .dd{color:inherit;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:.15em}
 .dd-code{cursor:pointer;border-radius:4px;-webkit-user-select:none;user-select:none}
 .dd-code:active{background:var(--bubble-hl)}
@@ -1593,7 +1599,7 @@ const APP_CSS = String.raw`
 
 /* iPad / 桌面：左右分栏 */
 .app.split .list-pane{right:auto;width:min(380px,40vw);border-right:.5px solid var(--sep);transform:none!important;visibility:visible!important}
-.app.split .list-pane::after{display:none}
+.app.split .pane-dim{display:none}
 .app.split .thread-pane{left:min(380px,40vw);transform:none!important;visibility:visible!important}
 .app.split .back{visibility:hidden}
 .app.split .threads{padding:0 8px}
@@ -1606,8 +1612,9 @@ const APP_CSS = String.raw`
 /* 上下文菜单 */
 .menu-layer{position:fixed;inset:0;z-index:50}
 .menu-backdrop{position:absolute;inset:0}
-.menu-layer.lift .menu-backdrop{background:transparent;-webkit-backdrop-filter:blur(0px);backdrop-filter:blur(0px);transition:background-color .3s ease,-webkit-backdrop-filter .3s ease,backdrop-filter .3s ease}
-.menu-layer.lift.open .menu-backdrop{background:var(--menu-dim);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}
+/* 模糊半径固定，只淡入这一层（动画模糊半径是全屏重绘，最费） */
+.menu-layer.lift .menu-backdrop{background:var(--menu-dim);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);opacity:0;transition:opacity .25s ease}
+.menu-layer.lift.open .menu-backdrop{opacity:1}
 .menu-preview{position:fixed;margin:0;z-index:1;transform-origin:0 50%;filter:drop-shadow(0 6px 18px rgba(0,0,0,.16))}
 .menu{position:fixed;z-index:2;min-width:220px;max-width:280px;padding:6px;border-radius:26px;background:var(--menu-bg);opacity:0}
 .menu-item{display:flex;align-items:center;gap:12px;width:100%;min-height:46px;padding:0 16px 0 12px;border-radius:20px;text-align:left;color:var(--label)}
@@ -1621,8 +1628,8 @@ const APP_CSS = String.raw`
 
 /* 操作表 */
 .sheet-layer{position:fixed;inset:0;z-index:55;display:flex;align-items:flex-end;justify-content:center}
-.sheet-scrim{position:absolute;inset:0;background:transparent;transition:background-color .3s ease}
-.sheet-layer.open .sheet-scrim{background:var(--scrim)}
+.sheet-scrim{position:absolute;inset:0;background:var(--scrim);opacity:0;transition:opacity .3s ease}
+.sheet-layer.open .sheet-scrim{opacity:1}
 .sheet{position:relative;width:min(calc(100% - 16px),420px);margin-bottom:calc(env(safe-area-inset-bottom) + 8px);display:flex;flex-direction:column;gap:8px}
 .sheet-group,.sheet-cancel{border-radius:26px;overflow:hidden;background:var(--sheet-bg);-webkit-backdrop-filter:blur(30px) saturate(180%);backdrop-filter:blur(30px) saturate(180%)}
 .sheet-head{padding:14px 20px 13px;text-align:center;border-bottom:.5px solid var(--sep)}
@@ -1638,8 +1645,8 @@ const APP_CSS = String.raw`
 /* 连接诊断（iOS 页面式表单） */
 .empty-btn{margin-top:18px;min-height:44px;padding:0 18px;color:var(--blue);font-size:.882rem;font-weight:600;letter-spacing:-.016em}
 .page-layer{position:fixed;inset:0;z-index:52}
-.page-scrim{position:absolute;inset:0;background:transparent;transition:background-color .3s ease}
-.page-layer.open .page-scrim{background:var(--scrim)}
+.page-scrim{position:absolute;inset:0;background:var(--scrim);opacity:0;transition:opacity .3s ease}
+.page-layer.open .page-scrim{opacity:1}
 .page-sheet{position:absolute;left:0;right:0;bottom:0;top:calc(env(safe-area-inset-top) + 12px);max-width:640px;margin:0 auto;display:flex;flex-direction:column;background:var(--page);border-radius:26px 26px 0 0;box-shadow:0 -8px 40px rgba(0,0,0,.18);overflow:hidden}
 .page-head{flex:none;position:relative;display:flex;align-items:center;justify-content:center;height:58px;touch-action:none;cursor:grab}
 .page-grabber{position:absolute;top:6px;left:50%;width:36px;height:5px;margin-left:-18px;border-radius:3px;background:var(--label-3)}
@@ -2079,10 +2086,8 @@ function bindRow(li) {
     g.tr.add(e.clientX, e.timeStamp);
     clearTimeout(pressT);
     if (!r.x && !openRow) {
-      pressT = setTimeout(function () {
-        main.classList.add('pressed');
-        if (r.t) fetchThread(r.t.sender).catch(noop); // 按住即预取，推入动画时内容已就绪
-      }, e.pointerType === 'mouse' ? 0 : 90);
+      if (r.t) fetchThread(r.t.sender).catch(noop); // 按下即预取：松手时数据多半已到，推入动画开始前就能画好
+      pressT = setTimeout(function () { main.classList.add('pressed'); }, e.pointerType === 'mouse' ? 0 : 90);
     }
   });
   main.addEventListener('pointermove', function (e) {
@@ -2164,10 +2169,27 @@ document.addEventListener('pointerdown', function (e) {
   if (openRow && !openRow.contains(e.target)) { closeRow(openRow); swallowClickUntil = Date.now() + 450; }
 }, true);
 
-function collapse(li, done) {
-  var h = li.offsetHeight;
-  var anim = li.animate([{ height: h + 'px', opacity: 1 }, { height: '0px', opacity: 0 }], { duration: mqReduce.matches ? 1 : 300, easing: 'cubic-bezier(.2,.8,.2,1)', fill: 'forwards' });
-  anim.onfinish = done;
+// 删除（FLIP）：先淡出，再一次性移出布局；下面的元素量出位移后用 transform 从原位置滑上来，不逐帧改 height
+function collapse(nodes, done) {
+  nodes = [].concat(nodes);
+  var reduce = mqReduce.matches;
+  var fades = nodes.map(function (n) {
+    return n.animate([{ opacity: 1 }, { opacity: 0 }], { duration: reduce ? 1 : 140, easing: 'ease-out', fill: 'forwards' });
+  });
+  fades[0].onfinish = function () {
+    var followers = [], n = nodes[nodes.length - 1].nextElementSibling;
+    while (n && followers.length < 40) { if (!n.classList.contains('time-rail')) followers.push(n); n = n.nextElementSibling; }
+    // 先全部读（前后各一次布局），再全部写，避免读写交错导致每行都重新布局
+    var before = followers.map(function (f) { return f.getBoundingClientRect().top; });
+    nodes.forEach(function (x) { x.style.display = 'none'; });
+    var shift = followers.map(function (f, i) { return before[i] - f.getBoundingClientRect().top; });
+    if (!reduce) {
+      followers.forEach(function (f, i) {
+        if (shift[i]) f.animate([{ transform: 'translate3d(0,' + shift[i] + 'px,0)' }, { transform: 'none' }], { duration: 320, easing: 'cubic-bezier(.23,1,.32,1)' });
+      });
+    }
+    done();
+  };
 }
 
 function swipeDelete(li, v, fromButton) {
@@ -2199,6 +2221,9 @@ function askDeleteThread(sender) {
 }
 
 function deleteThread(sender) {
+  // 先把这一行摘掉，renderThreads 就不会挪动下面正在上滑的行
+  var gone = rowMap.get(sender);
+  if (gone) { gone.remove(); rowMap.delete(sender); if (openRow === gone) openRow = null; }
   S.threads = S.threads.filter(function (t) { return t.sender !== sender; });
   cache.delete(sender);
   renderThreads();
@@ -2347,14 +2372,15 @@ $('moreBtn').addEventListener('click', function () {
 
 /* ---------- navigation (push / pop) ---------- */
 var navSpring = new Spring(applyNav, 1e4, 0.5);
-var lastEdgeTouch = 0, expectPop = false;
-function paneWidth() { return app.clientWidth || innerWidth; }
+var lastEdgeTouch = 0, expectPop = false, paneW = 0, paneDim = $('paneDim');
+// 宽度缓存起来：动画每帧读 clientWidth 会强制同步布局
+function paneWidth() { return paneW || (paneW = app.clientWidth || innerWidth); }
 function applyNav(x) {
   if (isSplit()) return;
   var w = paneWidth(), p = clamp(x / w, 0, 1);
   threadPane.style.transform = 'translate3d(' + Math.max(0, x) + 'px,0,0)';
   listPane.style.transform = p < 1 ? 'translate3d(' + (-(1 - p) * w * 0.3) + 'px,0,0)' : '';
-  listPane.style.setProperty('--dim', String((1 - p) * 0.1));
+  paneDim.style.opacity = String((1 - p) * 0.1);
   var hideThread = p >= 1, hideList = p <= 0;
   threadPane.style.visibility = hideThread ? 'hidden' : '';
   listPane.style.visibility = hideList ? 'hidden' : '';
@@ -2367,7 +2393,7 @@ function applyLayout() {
     navSpring.stop();
     threadPane.inert = listPane.inert = false;
     threadPane.style.visibility = listPane.style.visibility = '';
-    listPane.style.setProperty('--dim', '0');
+    paneDim.style.opacity = '0';
   } else {
     navSpring.set(S.threadShown ? 0 : paneWidth());
   }
@@ -2376,7 +2402,16 @@ function applyLayout() {
 }
 if (mqSplit.addEventListener) mqSplit.addEventListener('change', applyLayout);
 else mqSplit.addListener(applyLayout);
-addEventListener('resize', function () { if (!isSplit() && !navSpring.raf) navSpring.set(S.threadShown ? 0 : paneWidth()); });
+addEventListener('resize', function () {
+  paneW = 0;
+  railStale = true;
+  if (!isSplit() && !navSpring.raf) navSpring.set(S.threadShown ? 0 : paneWidth());
+});
+// 推入/返回动画进行中时，把重活（整段重绘对话）推迟到动画结束
+function whenNavIdle(fn) {
+  if (!navSpring.raf) fn();
+  else requestAnimationFrame(function () { whenNavIdle(fn); });
+}
 
 function showThread(animate) {
   S.threadShown = true;
@@ -2421,12 +2456,15 @@ function openThread(sender, opts) {
   var changed = S.current !== sender;
   S.current = sender;
   if (changed) {
-    var cached = cache.get(sender);
+    // 按下时预取的数据已经回来的话，直接用，推入动画开始前内容就在
+    var pre = inflight.get(sender);
+    var cached = cache.get(sender) || (pre && pre.data ? { messages: pre.data.messages, hasMore: pre.data.hasMore } : null);
     S.messages = cached ? cached.messages.slice() : [];
     S.hasMore = cached ? cached.hasMore : false;
     S.threadLoaded = !!cached;
     renderThreadHeader();
-    renderMessages();
+    var sliding = opts.animate !== false && !isSplit() && !mqReduce.matches && !opts.focusId;
+    renderMessages(null, sliding ? 24 : 0);
     if (!opts.focusId) scrollToBottom(false);
     loadThread(sender, opts.focusId);
   } else if (opts.focusId) {
@@ -2439,7 +2477,15 @@ function openThread(sender, opts) {
   }
   markSelected();
   showThread(opts.animate !== false);
+  if (changed) whenNavIdle(function () { completeRender(sender); });
   maybeMarkRead();
+}
+// 动画结束后把较早的信息补画出来，保持底部位置不动
+function completeRender(sender) {
+  if (S.current !== sender || !S.renderedFrom) return;
+  var fromBottom = threadScroll.scrollHeight - threadScroll.scrollTop;
+  renderMessages();
+  threadScroll.scrollTop = threadScroll.scrollHeight - fromBottom;
 }
 
 function goBack() {
@@ -2473,22 +2519,37 @@ function remember(sender) {
 function fetchThread(sender) {
   var f = inflight.get(sender);
   if (f && Date.now() - f.at < 3000) return f.p;
-  var p = api('/api/messages?sender=' + encodeURIComponent(sender));
-  inflight.set(sender, { p: p, at: Date.now() });
-  p.catch(function () { inflight.delete(sender); });
-  return p;
+  var entry = { p: null, at: Date.now(), data: null };
+  entry.p = api('/api/messages?sender=' + encodeURIComponent(sender));
+  entry.p.then(function (r) { entry.data = r; }, function () { inflight.delete(sender); });
+  inflight.set(sender, entry);
+  return entry.p;
+}
+function sameMessages(a, b) {
+  if (a.length !== b.length) return false;
+  for (var i = 0; i < a.length; i++) if (a[i].id !== b[i].id) return false;
+  return true;
 }
 function loadThread(sender, focusId) {
   fetchThread(sender).then(function (r) {
-    if (S.current !== sender) return;
-    var atBottom = !S.messages.length || nearBottom();
-    S.messages = r.messages; S.hasMore = r.hasMore; S.threadLoaded = true;
-    remember(sender);
-    renderMessages();
-    renderThreadHeader();
-    if (focusId) ensureFocus(focusId);
-    else if (atBottom) scrollToBottom(false);
-    maybeMarkRead();
+    whenNavIdle(function () {
+      if (S.current !== sender) return;
+      var unchanged = S.threadLoaded && S.hasMore === r.hasMore && sameMessages(S.messages, r.messages);
+      var wasEmpty = !S.messages.length;
+      var atBottom = wasEmpty || nearBottom();
+      S.messages = r.messages; S.hasMore = r.hasMore; S.threadLoaded = true;
+      remember(sender);
+      if (!unchanged) {
+        // 先画最新的一屏，其余下一帧补上，避免一帧里画完整段对话
+        renderMessages(null, wasEmpty && !focusId ? 24 : 0);
+        if (S.renderedFrom) requestAnimationFrame(function () { completeRender(sender); });
+        if (wasEmpty && S.messages.length && !mqReduce.matches) bubblesEl.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 180, easing: 'ease-out' });
+      }
+      renderThreadHeader();
+      if (focusId) ensureFocus(focusId);
+      else if (atBottom && !unchanged) scrollToBottom(false);
+      maybeMarkRead();
+    });
   }, noop);
 }
 function ensureFocus(id) {
@@ -2564,12 +2625,15 @@ function renderThreadHeader() {
   backBadge.hidden = !others;
 }
 
-function renderMessages(fresh) {
+// tail > 0 时只画最新的 tail 条（推入动画前用，首帧更轻），其余在动画结束后补上
+function renderMessages(fresh, tail) {
   bubblesEl.textContent = '';
   var frag = document.createDocumentFragment();
-  if (S.threadLoaded && !S.hasMore) frag.appendChild(el('div', 'thread-intro', '短信/彩信'));
   var list = S.messages;
-  for (var i = 0; i < list.length; i++) {
+  var from = tail > 0 ? Math.max(0, list.length - tail) : 0;
+  S.renderedFrom = from;
+  if (!from && S.threadLoaded && !S.hasMore) frag.appendChild(el('div', 'thread-intro', '短信/彩信'));
+  for (var i = from; i < list.length; i++) {
     var m = list[i], prev = list[i - 1], next = list[i + 1];
     if (!prev || m.ts - prev.ts > 15 * 60000 || dayStart(m.ts) !== dayStart(prev.ts)) {
       var sep = el('div', 'ts'), day = el('b', null, sepDay(m.ts));
@@ -2582,11 +2646,34 @@ function renderMessages(fresh) {
     var b = el('div', 'bubble' + (nextBreaks ? ' tail' : ''));
     fillBubble(b, m);
     row.appendChild(b);
-    row.appendChild(el('time', 'msg-time', clock(m.ts)));
+    row.appendChild(el('time', 'sr-only', clock(m.ts)));
     frag.appendChild(row);
   }
+  timeRail = el('div', 'time-rail');
+  timeRail.setAttribute('aria-hidden', 'true');
+  frag.appendChild(timeRail);
   bubblesEl.appendChild(frag);
+  railStale = true;
   renderQuick();
+}
+// 时间标签在开始左滑时才按当前布局摆放：先统一读位置，再统一写，避免读写交错导致反复布局
+var timeRail = null, railStale = true;
+function layoutTimeRail() {
+  if (!timeRail || !railStale) return;
+  var rows = bubblesEl.querySelectorAll('.msg'), spots = [];
+  for (var i = 0; i < rows.length; i++) {
+    var m = msgById(Number(rows[i].dataset.id));
+    if (m) spots.push([rows[i].offsetTop + rows[i].offsetHeight / 2, clock(m.ts)]);
+  }
+  var frag = document.createDocumentFragment();
+  spots.forEach(function (s) {
+    var label = el('span', null, s[1]);
+    label.style.top = s[0] + 'px';
+    frag.appendChild(label);
+  });
+  timeRail.textContent = '';
+  timeRail.appendChild(frag);
+  railStale = false;
 }
 
 // 数据检测：验证码、链接、电话号码（全部用 DOM 文本节点构建，杜绝 XSS）
@@ -2653,7 +2740,7 @@ $('quickBtn').addEventListener('click', function () { if (quickEl.dataset.code) 
 
 threadScroll.addEventListener('scroll', function () {
   threadPane.classList.toggle('scrolled', threadScroll.scrollTop > 2);
-  if (threadScroll.scrollTop < 400 && S.hasMore && !S.loadingOlder && S.threadLoaded) loadOlder();
+  if (threadScroll.scrollTop < 400 && S.hasMore && !S.loadingOlder && S.threadLoaded && !S.renderedFrom) loadOlder();
 }, { passive: true });
 
 $('peerBtn').addEventListener('click', function () {
@@ -2674,8 +2761,9 @@ $('peerBtn').addEventListener('click', function () {
 
 /* ---------- thread gestures: swipe left = timestamps, swipe right = back ---------- */
 var revealSpring = new Spring(function (r) {
-  bubblesEl.style.setProperty('--reveal', r + 'px');
-  bubblesEl.style.setProperty('--reveal-o', String(clamp(-r / 60, 0, 1)));
+  if (!timeRail) return;
+  timeRail.style.transform = 'translate3d(' + (REVEAL_W + r) + 'px,0,0)';
+  timeRail.style.opacity = String(clamp(-r / 60, 0, 1));
 }, 0, 0.3);
 (function () {
   var g = null;
@@ -2696,7 +2784,7 @@ var revealSpring = new Spring(function (r) {
       g.ox = e.clientX;
       cancelLongPress();
       if (g.mode === 'pop') { navSpring.stop(); g.base = navSpring.x; listPane.style.visibility = ''; }
-      else { revealSpring.stop(); g.base = revealSpring.x; }
+      else { revealSpring.stop(); g.base = revealSpring.x; layoutTimeRail(); }
       try { threadScroll.setPointerCapture(e.pointerId); } catch (err) {}
     }
     var d = e.clientX - g.ox;
@@ -2799,10 +2887,14 @@ function deleteMessage(m) {
     function finish() {
       S.messages = S.messages.filter(function (x) { return x.id !== m.id; });
       remember(sender);
-      renderMessages();
-      if (!S.messages.length) deleteThreadLocal(sender);
+      if (!S.messages.length) { renderMessages(); deleteThreadLocal(sender); return; }
+      // 等下面的气泡滑完再重绘（要重新计算尾巴和时间分隔）
+      setTimeout(function () { if (S.current === sender) renderMessages(); }, mqReduce.matches ? 0 : 340);
     }
-    if (row) collapse(row, finish); else finish();
+    // 这条信息自带的时间分隔（下面没有同组信息）一起收起
+    var sep = row && row.previousElementSibling, next = row && row.nextElementSibling;
+    var orphan = sep && sep.classList.contains('ts') && (!next || !next.classList.contains('msg'));
+    if (row) collapse(orphan ? [sep, row] : row, finish); else finish();
     api('/api/delete', { id: m.id }).then(refreshSoon, function () { toast('删除失败', '', true); refreshSoon(); });
   });
 }
@@ -3281,11 +3373,16 @@ var pollTimer = 0, refreshing = null;
 function refresh() {
   if (refreshing) return refreshing;
   refreshing = api('/api/threads').then(function (r) {
-    S.version = r.version; S.threads = r.threads; S.latestCode = r.latestCode;
-    S.skew = r.now - Date.now(); S.loaded = true;
-    renderThreads();
-    renderCodeCard();
-    if (S.current) { renderThreadHeader(); return syncThread(); }
+    // 数据随时可以取，DOM 更新等推入/返回动画结束再做，免得动画中途卡一帧
+    return new Promise(function (resolve) {
+      whenNavIdle(function () {
+        S.version = r.version; S.threads = r.threads; S.latestCode = r.latestCode;
+        S.skew = r.now - Date.now(); S.loaded = true;
+        renderThreads();
+        renderCodeCard();
+        resolve(S.current ? (renderThreadHeader(), syncThread()) : null);
+      });
+    });
   }).then(function () { refreshing = null; }, function (err) { refreshing = null; throw err; });
   return refreshing;
 }
