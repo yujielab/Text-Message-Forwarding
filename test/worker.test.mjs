@@ -1,15 +1,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import {
   parseSms,
   parseSmsTime,
   extractCode,
   messageFromEmail,
   verifyWebhookSignature,
+  webhookSignatureProblem,
+  webhookSecretState,
   recipientAllowed,
   normalizeSender,
   htmlToText,
+  secret,
 } from '../worker.js';
 
 const CN = 480; // +08:00
@@ -118,6 +122,9 @@ test('recipient filter', () => {
   assert.equal(recipientAllowed('other@cuven.us, 0901@CUVEN.us', data), true);
   assert.equal(recipientAllowed('@cuven.us', data), true);
   assert.equal(recipientAllowed('@0901.cuven.us', data), false);
+  assert.equal(recipientAllowed('cuven.us', data), true, 'bare domain rule');
+  assert.equal(recipientAllowed('0901.cuven.us', data), false, 'subdomain is a different domain');
+  assert.equal(recipientAllowed('0901.cuven.us', { to: ['a@0901.cuven.us'] }), true);
   assert.equal(recipientAllowed('someone@cuven.us', data), false);
 });
 
@@ -135,4 +142,65 @@ test('Resend (Svix) webhook signature verification', async () => {
   assert.equal(await verifyWebhookSignature(body + ' ', headers(`v1,${sig}`), secret), false, 'tampered body');
   assert.equal(await verifyWebhookSignature(body, headers(`v1,${sig}`, String(Number(ts) - 3600)), secret), false, 'stale timestamp');
   assert.equal(await verifyWebhookSignature(body, new Headers(), secret), false, 'missing headers');
+});
+
+test('webhook signature failures are classified for diagnostics', async () => {
+  const key = crypto.randomBytes(24);
+  const secret = 'whsec_' + key.toString('base64');
+  const body = '{"type":"email.received"}';
+  const ts = String(Math.floor(Date.now() / 1000));
+  const sig = 'v1,' + crypto.createHmac('sha256', key).update(`m.${ts}.${body}`).digest('base64');
+  const h = (t = ts, s = sig) => new Headers({ 'svix-id': 'm', 'svix-timestamp': t, 'svix-signature': s });
+
+  assert.equal(await webhookSignatureProblem(body, h(), secret), '');
+  assert.equal(await webhookSignatureProblem(body, h(), ` ${secret}\n`), '', 'pasted secret with whitespace');
+  assert.equal(await webhookSignatureProblem(body, new Headers(), secret), 'missing_headers');
+  assert.equal(await webhookSignatureProblem(body, h(String(Number(ts) - 600)), secret), 'stale_timestamp');
+  assert.equal(await webhookSignatureProblem(body, h(), 'whsec_' + crypto.randomBytes(24).toString('base64')), 'signature_mismatch');
+  assert.equal(await webhookSignatureProblem(body, h(), 'whsec_###'), 'secret_not_base64');
+
+  assert.equal(webhookSecretState(secret), 'ok');
+  assert.equal(webhookSecretState(''), 'missing');
+  assert.equal(webhookSecretState('whsec_abc'), 'format');
+});
+
+test('secrets pasted with whitespace or quotes are normalized', () => {
+  assert.equal(secret({ K: '  re_abc\n' }, 'K'), 're_abc');
+  assert.equal(secret({ K: '"whsec_x+/="' }, 'K'), 'whsec_x+/=');
+  assert.equal(secret({ K: " 're_abc' " }, 'K'), 're_abc');
+  assert.equal(secret({}, 'K'), '');
+});
+
+// 诊断页的判断逻辑在前端字符串里，这里直接取出来跑
+function loadVerdict() {
+  const src = fs.readFileSync(new URL('../worker.js', import.meta.url), 'utf8');
+  const start = src.indexOf('var RESULT_TEXT = {');
+  const fn = src.indexOf('function verdict(d) {');
+  const end = src.indexOf('\n}\n', fn) + 2;
+  const body = src.slice(start, src.indexOf('function stamp', start)) + src.slice(fn, end);
+  return new Function(`${body}; return verdict;`)();
+}
+
+test('diagnostics verdict trusts delivery evidence over setup heuristics', () => {
+  const verdict = loadVerdict();
+  const base = { config: { apiKey: 'ok', webhookSecret: 'ok', inbox: '', webhookUrl: 'https://x/webhooks/resend' }, messages: 3 };
+  const stored = { ...base, resend: { ok: true, emails: [{ allowed: true, state: 'stored', to: 'a@x' }] }, webhooks: [{ result: 'stored' }] };
+  // 收信域名列表为空（比如用的是 *.resend.app）但邮件已入库 → 正常
+  assert.equal(verdict({ ...stored, setup: { webhooks: { ok: true, items: [] }, domains: { ok: true, items: [] } } })[0], 'ok');
+  // 最新的已入库、较早的漏了 → 提示导入，而不是报错
+  const older = { ...base, resend: { ok: true, emails: [{ allowed: true, state: 'stored' }, { allowed: true, state: 'missing' }] }, webhooks: [] };
+  assert.deepEqual(verdict(older).slice(0, 1), ['warn']);
+  // 最新的没入库 + Webhook 被停用 → 报 Webhook 已被停用
+  const disabled = { ...base, resend: { ok: true, emails: [{ allowed: true, state: 'missing', to: 'a@x' }] }, webhooks: [],
+    setup: { webhooks: { ok: true, items: [{ matches: true, status: 'disabled', events: ['email.received'] }] }, domains: { ok: true, items: [] } } };
+  assert.equal(verdict(disabled)[1], 'Webhook 已被停用');
+  // Resend 一封都没收到 + 没有开启收信的域名
+  const none = { ...base, resend: { ok: true, emails: [] }, webhooks: [],
+    setup: { webhooks: { ok: true, items: [{ matches: true, status: 'enabled', events: null }] }, domains: { ok: true, items: [{ name: 'cuven.us', receiving: 'disabled' }] } } };
+  assert.equal(verdict(none)[1], '没有开启收信的域名');
+  // 读不到收件箱
+  assert.equal(verdict({ ...base, resend: { ok: false, error: '401 restricted_api_key' }, webhooks: [] })[0], 'bad');
+  // 最新一次是签名失败，且没有入库证据
+  const sig = { ...base, resend: { ok: true, emails: [{ allowed: true, state: 'missing', to: 'a@x' }] }, webhooks: [{ result: 'invalid_signature', detail: 'signature_mismatch' }], setup: null };
+  assert.equal(verdict(sig)[1], 'Webhook 签名校验失败');
 });

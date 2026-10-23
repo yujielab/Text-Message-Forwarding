@@ -69,6 +69,23 @@ npm run deploy
 
 Safari 打开 Worker 地址 → 输入访问密码 → 分享 → **添加到主屏幕**。
 
+## 收不到信息？
+
+打开网页 → 右上角「…」→ **连接诊断**（列表为空时也可以点「检查连接」）。它会直接告诉你卡在哪一步：
+
+| 诊断结果 | 原因 | 处理 |
+| --- | --- | --- |
+| 无法读取 Resend 收件箱 · 401 | API Key 填错，或是只有发信权限的 Key | 在 Resend 新建 **Full access** 的 Key，更新 `RESEND_API_KEY` |
+| Resend 还没有收到任何邮件 | 手机发到了别的地址（`0901@cuven.us` 和 `…@0901.cuven.us` 是两个不同的域名） | 诊断页会显示开启收信的域名，手机要发到 `…@该域名` |
+| Webhook 已被停用 / 没有指向这里的 Webhook | 之前连续失败被 Resend 自动停用，或地址、事件填错 | 地址填诊断页里的「Webhook 地址」（填成根地址也可以），勾选 `email.received`，在 Resend 里重新启用 |
+| 没有开启收信的域名 / MX 未验证 | 域名没打开 Receiving，或 MX 记录没加在对应主机上 | 诊断页「Resend 设置」会列出每个域名的收信状态和实际 MX 记录 |
+| Webhook 签名校验失败 | `RESEND_WEBHOOK_SECRET` 和 Resend 后台的 Signing secret 不一致 | 重新复制 `whsec_...` |
+| N 封邮件还没入库 | Webhook 之前失败过（Resend 重试几次后就放弃了） | 点「从 Resend 导入」补上 |
+
+> 1.1 之前的版本请求 Resend API 时没有带 `User-Agent`，在线上会被 Resend 以 403（error 1010）拒绝，导致所有邮件都存不进来。升级后点「从 Resend 导入」，它会往前翻页，把 Resend 还保存着的邮件都补回来（每次最多 25 封，没补完会自动接着补；导入的信息保留邮件原本的接收时间，旧验证码不会被当成新的）。
+
+另外，打开网页时会自动向 Resend 补拉一次最新邮件里漏掉的（20 秒内只拉一次）；想在不打开网页时也自动补拉，可以在 `wrangler.toml` 里打开每分钟一次的 Cron Trigger。
+
 ## 不用命令行部署
 
 Cloudflare 控制台 → Workers & Pages → 创建 Worker → 编辑代码，粘贴整个 `worker.js` → 部署。然后在 Worker 的 设置 → 绑定 里添加 D1 数据库（变量名 `DB`），在 变量和机密 里添加 `ACCESS_PASSWORD`、`RESEND_API_KEY`、`RESEND_WEBHOOK_SECRET`（以及可选的 `INBOX`、`TZ_OFFSET`）。
@@ -116,3 +133,5 @@ npm test         # 解析、验证码识别、Webhook 签名的单元测试
 | `GET /api/messages?sender=` | 某个对话的信息（支持 `before_ts`/`before_id` 翻页、`after` 增量） |
 | `GET /api/search?q=` | 搜索 |
 | `POST /api/read`、`POST /api/delete` | 标记已读/未读、删除 |
+| `GET /api/diagnostics` | 连接诊断（配置、Resend 收件箱、最近 Webhook 请求） |
+| `POST /api/import` | 从 Resend 补拉漏掉的邮件（`{"force": true}` 跳过 20 秒限流） |

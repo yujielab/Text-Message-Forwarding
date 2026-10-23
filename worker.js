@@ -21,8 +21,12 @@ const LOGIN_MAX_FAILS = 10;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const WEBHOOK_TOLERANCE_S = 5 * 60;
 const RESEND_API = 'https://api.resend.com';
+const RESEND_USER_AGENT = 'sms-inbox-worker/1.1';
 const MAX_BODY_CHARS = 4000;
 const PAGE_SIZE = 80;
+const WEBHOOK_LOG_KEEP = 50;
+const IMPORT_LIMIT = 20;
+const IMPORT_THROTTLE_MS = 20 * 1000;
 
 const enc = new TextEncoder();
 
@@ -35,9 +39,21 @@ export default {
       return json({ error: 'internal_error' }, 500);
     }
   },
+
+  // 可选：在 wrangler.toml 里配置 Cron Trigger 后，定时从 Resend 补拉 Webhook 漏掉的邮件
+  async scheduled(event, env, ctx) {
+    if (!env.DB || !secret(env, 'RESEND_API_KEY')) return;
+    ctx.waitUntil(
+      ensureSchema(env.DB)
+        .then(() => importFromResend(env))
+        .then((r) => {
+          if (!r.ok) console.error('scheduled import failed', r.error);
+        }),
+    );
+  },
 };
 
-async function handle(request, env) {
+async function handle(request, env, ctx) {
   const url = new URL(request.url);
   const { pathname } = url;
   const method = request.method;
@@ -51,9 +67,10 @@ async function handle(request, env) {
     if (pathname === '/favicon.ico') return new Response(null, { status: 204 });
   }
 
-  if (pathname === '/webhooks/resend') {
+  // 带 Svix 签名头的 POST 一律按 Webhook 处理，Resend 里填成根地址也能收
+  if (pathname === '/webhooks/resend' || (method === 'POST' && request.headers.has('svix-id'))) {
     if (method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
-    return handleResendWebhook(request, env);
+    return handleResendWebhook(request, env, ctx);
   }
 
   const problems = configProblems(env);
@@ -73,8 +90,8 @@ async function handle(request, env) {
   if (pathname === '/' && (method === 'GET' || method === 'HEAD')) return authed ? appPage(env) : loginPage();
   if (pathname.startsWith('/api/')) {
     if (!authed) return json({ error: 'unauthorized' }, 401);
-    // 简单 CSRF 防护：写操作必须带自定义请求头（跨站表单无法设置）
-    if (method !== 'GET' && request.headers.get('X-Requested-With') !== 'fetch') return json({ error: 'forbidden' }, 403);
+    // 简单 CSRF 防护：所有接口都要带自定义请求头（跨站表单和跳转都带不上）
+    if (request.headers.get('X-Requested-With') !== 'fetch') return json({ error: 'forbidden' }, 403);
     return handleApi(request, env, url);
   }
   return new Response('Not found', { status: 404, headers: SECURITY_HEADERS });
@@ -114,6 +131,11 @@ function ensureSchema(db) {
         db.prepare('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL)'),
         db.prepare("INSERT OR IGNORE INTO meta (k, v) VALUES ('version', 0)"),
         db.prepare('CREATE TABLE IF NOT EXISTS login_fails (ip TEXT PRIMARY KEY, fails INTEGER NOT NULL, until INTEGER NOT NULL)'),
+        // 已删除邮件的 Resend id，防止补拉时又导回来
+        db.prepare('CREATE TABLE IF NOT EXISTS deleted_emails (email_id TEXT PRIMARY KEY)'),
+        db.prepare(
+          'CREATE TABLE IF NOT EXISTS webhook_log (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, status INTEGER NOT NULL, result TEXT NOT NULL, detail TEXT, email_id TEXT)',
+        ),
       ])
       .catch((err) => {
         schemaReady = null;
@@ -139,89 +161,364 @@ const LATEST_CODE_SQL = `
   WHERE code IS NOT NULL ORDER BY received_at DESC, id DESC LIMIT 1`;
 const MESSAGE_COLUMNS = 'id, body, code, sent_at AS ts, received_at AS rx';
 
-async function insertMessage(db, record, emailId) {
+async function insertMessage(db, record, emailId, receivedAt = Date.now()) {
+  const id = emailId || null;
   const [insert] = await db.batch([
     db
-      .prepare('INSERT OR IGNORE INTO messages (email_id, sender, body, code, sent_at, raw_time, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .bind(emailId || null, record.sender, record.body, record.code || null, record.sentAt, record.rawTime || null, Date.now()),
+      .prepare(
+        `INSERT OR IGNORE INTO messages (email_id, sender, body, code, sent_at, raw_time, received_at)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE NOT EXISTS (SELECT 1 FROM deleted_emails WHERE email_id = ?1)`,
+      )
+      .bind(id, record.sender, record.body, record.code || null, record.sentAt, record.rawTime || null, receivedAt),
     db.prepare(BUMP_VERSION_SQL),
   ]);
   return insert.meta.changes > 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* Resend inbound webhook                                              */
+/* Resend inbound: webhook, import, diagnostics                        */
 /* ------------------------------------------------------------------ */
 
-async function handleResendWebhook(request, env) {
-  if (!env.DB || !env.RESEND_WEBHOOK_SECRET) {
-    console.error('webhook: DB or RESEND_WEBHOOK_SECRET missing');
-    return json({ error: 'not_configured' }, 503);
+// 控制台里粘贴的值常带空格、换行或引号
+function secret(env, name) {
+  return String(env[name] || '')
+    .trim()
+    .replace(/^(["'])([\s\S]*)\1$/, '$2')
+    .trim();
+}
+
+// Resend API 要求带 User-Agent（否则被 403 error 1010 拦截），Workers 的 fetch 默认不带
+async function resendGet(env, path) {
+  const send = () =>
+    fetch(`${secret(env, 'RESEND_API_URL') || RESEND_API}${path}`, {
+      headers: { Authorization: `Bearer ${secret(env, 'RESEND_API_KEY')}`, 'User-Agent': RESEND_USER_AGENT, Accept: 'application/json' },
+    });
+  let res = await send();
+  if (res.status === 429) {
+    // 团队级限流（每秒几次），按 retry-after 等一下再试一次
+    await sleep(Math.min(2000, (Number(res.headers.get('retry-after')) || 1) * 1000));
+    res = await send();
   }
+  return res;
+}
+
+async function resendJson(env, path) {
+  const res = await resendGet(env, path);
+  if (!res.ok) return { ok: false, error: await resendError(res) };
+  return { ok: true, data: await res.json() };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function resendError(res) {
+  const text = await res.text().catch(() => '');
+  try {
+    const body = JSON.parse(text);
+    return `${res.status} ${body.name || ''} ${body.message || ''}`.trim();
+  } catch {
+    return `${res.status} ${text.slice(0, 200)}`.trim();
+  }
+}
+
+async function handleResendWebhook(request, env, ctx) {
+  let outcome;
+  try {
+    outcome = await processResendWebhook(request, env);
+  } catch (err) {
+    outcome = { status: 500, result: 'error', detail: String((err && err.message) || err) };
+  }
+  if (outcome.status >= 400) console.error('webhook', outcome.status, outcome.result, outcome.detail || '');
+  if (env.DB && outcome.log !== false) {
+    const write = logWebhook(env.DB, outcome).catch((err) => console.error('webhook log failed', err));
+    if (ctx && ctx.waitUntil) ctx.waitUntil(write);
+    else await write;
+  }
+  return json({ result: outcome.result, detail: outcome.detail || undefined }, outcome.status);
+}
+
+async function processResendWebhook(request, env) {
+  if (!env.DB) return { status: 503, result: 'not_configured', detail: 'D1 数据库 DB 未绑定', log: false };
+  await ensureSchema(env.DB);
+  if (!secret(env, 'RESEND_WEBHOOK_SECRET')) return { status: 503, result: 'not_configured', detail: 'RESEND_WEBHOOK_SECRET 未设置' };
+
   const payload = await request.text();
-  if (!(await verifyWebhookSignature(payload, request.headers, env.RESEND_WEBHOOK_SECRET))) {
-    return json({ error: 'invalid_signature' }, 401);
-  }
+  const problem = await webhookSignatureProblem(payload, request.headers, secret(env, 'RESEND_WEBHOOK_SECRET'));
+  // 没带 Svix 头的多半是扫描器，不记日志
+  if (problem) return { status: 401, result: 'invalid_signature', detail: problem, log: problem !== 'missing_headers' };
 
   let event;
   try {
     event = JSON.parse(payload);
   } catch {
-    return json({ error: 'invalid_json' }, 400);
+    return { status: 400, result: 'invalid_json' };
   }
-  if (!event || event.type !== 'email.received') return json({ ignored: event && event.type });
+  if (!event || event.type !== 'email.received') return { status: 200, result: 'ignored_event', detail: String(event && event.type) };
 
   const data = event.data || {};
   if (!recipientAllowed(env.INBOX, data)) {
-    console.log('webhook: recipient not in INBOX, ignored', data.to);
-    return json({ ignored: 'recipient' });
+    return { status: 200, result: 'ignored_recipient', detail: recipientsOf(data).join(', '), emailId: data.email_id };
   }
+  return { ...(await storeReceivedEmail(env, data)), emailId: data.email_id };
+}
 
-  // Webhook 只带元数据，正文需要再调 Receiving API 读取
-  let email = data;
-  if (data.text == null && data.html == null) {
-    if (!env.RESEND_API_KEY) {
-      console.error('webhook: RESEND_API_KEY missing, cannot read email body');
-      return json({ error: 'not_configured' }, 503);
-    }
-    const res = await fetch(`${RESEND_API}/emails/receiving/${encodeURIComponent(data.email_id)}`, {
-      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}` },
-    });
-    if (!res.ok) {
-      console.error('webhook: Resend API error', res.status, await res.text().catch(() => ''));
-      return json({ error: 'resend_api_error', status: res.status }, 502); // 非 2xx → Resend 会重试
-    }
-    email = { ...data, ...(await res.json()) };
+// Webhook 和补拉共用：Webhook / 列表接口都只有元数据，正文要再调 Receiving API 读取
+async function storeReceivedEmail(env, meta) {
+  const emailId = meta.email_id || meta.id;
+  let email = meta;
+  if (meta.text == null && meta.html == null) {
+    if (!secret(env, 'RESEND_API_KEY')) return { status: 503, result: 'not_configured', detail: 'RESEND_API_KEY 未设置' };
+    const res = await resendGet(env, `/emails/receiving/${encodeURIComponent(emailId)}?html_format=cid`);
+    // 非 2xx → Resend 会重试这次 Webhook
+    if (!res.ok) return { status: 502, result: 'resend_api_error', detail: await resendError(res) };
+    email = { ...meta, ...(await res.json()) };
   }
-
-  await ensureSchema(env.DB);
   const record = messageFromEmail(email, parseTzOffset(env.TZ_OFFSET));
-  const inserted = await insertMessage(env.DB, record, data.email_id || email.id);
-  return json({ ok: true, inserted });
+  // 用 Resend 收到邮件的时间：补拉或 Webhook 重试时，旧验证码不能显示成「刚刚」
+  const receivedAt = Math.min(Date.now(), Date.parse(email.created_at || '') || Date.now());
+  const inserted = await insertMessage(env.DB, record, emailId, receivedAt);
+  return { status: 200, result: inserted ? 'stored' : 'duplicate', detail: record.sender };
+}
+
+async function logWebhook(db, outcome) {
+  const now = Date.now();
+  // 签名错误的请求谁都能发：每分钟最多记一条，免得被刷爆 D1 写入或冲掉真实记录
+  const throttle = outcome.result === 'invalid_signature' ? now - 60000 : now + 1;
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO webhook_log (at, status, result, detail, email_id) SELECT ?1, ?2, ?3, ?4, ?5
+         WHERE NOT EXISTS (SELECT 1 FROM webhook_log WHERE result = ?3 AND at > ?6)`,
+      )
+      .bind(now, outcome.status, outcome.result, String(outcome.detail || '').slice(0, 300), outcome.emailId || null, throttle),
+    db.prepare('DELETE FROM webhook_log WHERE id <= (SELECT MAX(id) FROM webhook_log) - ?').bind(WEBHOOK_LOG_KEEP),
+  ]);
+}
+
+// 从 Resend 收件箱补拉 Webhook 没送达的邮件（已入库或已删除的跳过）。
+// 平时只看最新一页；手动导入会往前翻页。每次请求最多读 maxFetch 封正文（Workers 子请求有上限），
+// 没读完时返回 more: true，由前端接着再调。
+async function importFromResend(env, { pageSize = IMPORT_LIMIT, maxPages = 1, maxFetch = 10 } = {}) {
+  if (!secret(env, 'RESEND_API_KEY')) return { ok: false, error: 'RESEND_API_KEY 未设置' };
+  const result = { ok: true, checked: 0, imported: 0, skipped: 0, errors: [], more: false };
+  const seen = new Set();
+  let after = '';
+  let fetched = 0;
+  pages: for (let page = 0; page < maxPages; page++) {
+    const res = await resendGet(env, `/emails/receiving?limit=${pageSize}${after ? `&after=${encodeURIComponent(after)}` : ''}`);
+    if (!res.ok) {
+      if (!page) return { ok: false, error: await resendError(res) };
+      result.errors.push(await resendError(res));
+      break;
+    }
+    const list = await res.json();
+    const emails = (list.data || []).filter((e) => e && e.id && !seen.has(e.id));
+    if (!emails.length) break;
+    emails.forEach((e) => seen.add(e.id));
+    result.checked += emails.length;
+    const known = await knownEmailIds(env.DB, emails.map((e) => e.id));
+    for (const email of emails.slice().reverse()) {
+      if (known.has(email.id)) continue;
+      if (!recipientAllowed(env.INBOX, email)) {
+        result.skipped++;
+        continue;
+      }
+      if (fetched >= maxFetch) {
+        result.more = true;
+        break pages;
+      }
+      if (fetched++) await sleep(300); // 别撞上 Resend 的团队限流
+      const stored = await storeReceivedEmail(env, { ...email, email_id: email.id });
+      if (stored.result === 'stored') result.imported++;
+      else if (stored.status >= 400) {
+        result.errors.push(stored.detail);
+        if (/^429\b/.test(stored.detail)) {
+          result.more = true; // 剩下的留给下次补拉
+          break pages;
+        }
+      }
+    }
+    if (!list.has_more) break;
+    after = emails[emails.length - 1].id;
+  }
+  return result;
+}
+
+// email_id → 'stored' | 'deleted'
+async function knownEmailIds(db, ids) {
+  const known = new Map();
+  if (!ids.length) return known;
+  const marks = ids.map(() => '?').join(',');
+  const [stored, deleted] = await db.batch([
+    db.prepare(`SELECT email_id FROM messages WHERE email_id IN (${marks})`).bind(...ids),
+    db.prepare(`SELECT email_id FROM deleted_emails WHERE email_id IN (${marks})`).bind(...ids),
+  ]);
+  for (const row of deleted.results) known.set(row.email_id, 'deleted');
+  for (const row of stored.results) known.set(row.email_id, 'stored');
+  return known;
+}
+
+// 页面打开时顺手补拉一次；限流，避免每个设备每次轮询都打 Resend
+async function throttledImport(env, force) {
+  const db = env.DB;
+  const now = Date.now();
+  if (force) return importFromResend(env, { pageSize: 100, maxPages: 10, maxFetch: 25 });
+  const claim = await db
+    .prepare("INSERT INTO meta (k, v) VALUES ('last_import', ?1) ON CONFLICT(k) DO UPDATE SET v = ?1 WHERE v < ?2")
+    .bind(now, now - IMPORT_THROTTLE_MS)
+    .run();
+  if (!claim.meta.changes) return { ok: true, throttled: true, imported: 0 };
+  return importFromResend(env);
+}
+
+async function diagnostics(env, origin) {
+  const db = env.DB;
+  const config = {
+    webhookUrl: `${origin}/webhooks/resend`,
+    apiKey: !secret(env, 'RESEND_API_KEY') ? 'missing' : /^re_[\w-]+$/.test(secret(env, 'RESEND_API_KEY')) ? 'ok' : 'format',
+    webhookSecret: webhookSecretState(secret(env, 'RESEND_WEBHOOK_SECRET')),
+    inbox: String(env.INBOX || '').trim(),
+    tz: String(env.TZ_OFFSET || '+08:00'),
+  };
+  let resend = null;
+  let setup = null;
+  if (config.apiKey !== 'missing') {
+    const res = await resendGet(env, '/emails/receiving?limit=10');
+    setup = await resendSetup(env, origin).catch((err) => {
+      const error = String((err && err.message) || err);
+      return { webhooks: { ok: false, error }, domains: { ok: false, error } };
+    });
+    if (res.ok) {
+      const emails = ((await res.json()).data || []).filter((e) => e && e.id);
+      const known = await knownEmailIds(db, emails.map((e) => e.id));
+      resend = {
+        ok: true,
+        emails: emails.map((e) => ({
+          id: e.id,
+          to: recipientsOf(e).join(', '),
+          from: displayFrom(e.from),
+          // INBOX 之外的邮件只显示收件人，不显示主题
+          subject: recipientAllowed(env.INBOX, e) ? e.subject || '' : '',
+          at: Date.parse(e.created_at || '') || null,
+          state: known.get(e.id) || 'missing',
+          allowed: recipientAllowed(env.INBOX, e),
+        })),
+      };
+    } else {
+      resend = { ok: false, error: await resendError(res) };
+    }
+  }
+  const [log, count] = await db.batch([
+    db.prepare('SELECT at, status, result, detail FROM webhook_log ORDER BY id DESC LIMIT 20'),
+    db.prepare('SELECT COUNT(*) AS n FROM messages'),
+  ]);
+  return { config, resend, setup, webhooks: log.results, messages: count.results[0] ? count.results[0].n : 0, now: Date.now() };
+}
+
+// 读 Resend 后台的 Webhook 和域名收信配置，再用 DoH 查 MX，判断邮件到底能不能进 Resend
+async function resendSetup(env, origin) {
+  const ownHost = new URL(origin).host;
+  const hooks = await resendJson(env, '/webhooks');
+  const webhooks = hooks.ok
+    ? {
+        ok: true,
+        items: (hooks.data.data || []).map((w) => {
+          let url = null;
+          try {
+            url = new URL(w.endpoint);
+          } catch {}
+          return {
+            endpoint: url ? url.origin + url.pathname : String(w.endpoint || ''),
+            status: w.status,
+            events: w.events,
+            matches: !!url && (url.host === ownHost || url.pathname === '/webhooks/resend'),
+          };
+        }),
+      }
+    : { ok: false, error: hooks.error };
+
+  const list = await resendJson(env, '/domains');
+  let domains;
+  if (list.ok) {
+    const items = [];
+    for (const d of (list.data.data || []).slice(0, 5)) {
+      const detail = await resendJson(env, `/domains/${encodeURIComponent(d.id)}`);
+      const records = detail.ok ? detail.data.records || [] : [];
+      const mx = records.find((r) => r.record === 'Receiving');
+      items.push({
+        name: d.name,
+        receiving: ((detail.ok && detail.data.capabilities) || d.capabilities || {}).receiving || 'disabled',
+        mxRecord: mx ? { status: mx.status, value: mx.value, priority: mx.priority } : null,
+        dns: await lookupMx(d.name),
+      });
+    }
+    domains = { ok: true, items };
+  } else {
+    domains = { ok: false, error: list.error };
+  }
+  return { webhooks, domains };
+}
+
+async function lookupMx(host) {
+  try {
+    const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=MX`, {
+      headers: { Accept: 'application/dns-json' },
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    return (body.Answer || [])
+      .filter((a) => a.type === 15)
+      .map((a) => {
+        const [priority, target] = String(a.data).split(/\s+/);
+        return { priority: Number(priority), host: String(target || '').replace(/\.$/, '') };
+      })
+      .sort((x, y) => x.priority - y.priority);
+  } catch {
+    return null;
+  }
+}
+
+function webhookSecretState(value) {
+  if (!value) return 'missing';
+  try {
+    return base64ToBytes(value.replace(/^whsec_/, '')).length >= 16 ? 'ok' : 'format';
+  } catch {
+    return 'format';
+  }
+}
+
+function recipientsOf(data) {
+  return [...new Set([].concat(data.received_for || [], data.to || []).map(emailAddress).filter(Boolean))];
 }
 
 // Resend 使用 Svix / Standard Webhooks 签名：base64(HMAC-SHA256(secret, `${id}.${timestamp}.${body}`))
-async function verifyWebhookSignature(payload, headers, secret) {
+async function verifyWebhookSignature(payload, headers, secretValue) {
+  return (await webhookSignatureProblem(payload, headers, secretValue)) === '';
+}
+
+async function webhookSignatureProblem(payload, headers, secretValue) {
   const id = headers.get('svix-id') || headers.get('webhook-id');
   const timestamp = headers.get('svix-timestamp') || headers.get('webhook-timestamp');
   const signatures = headers.get('svix-signature') || headers.get('webhook-signature');
-  if (!id || !timestamp || !signatures) return false;
+  if (!id || !timestamp || !signatures) return 'missing_headers';
   const ts = Number(timestamp);
-  if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > WEBHOOK_TOLERANCE_S) return false;
+  if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > WEBHOOK_TOLERANCE_S) return 'stale_timestamp';
 
   let keyBytes;
   try {
-    keyBytes = base64ToBytes(secret.startsWith('whsec_') ? secret.slice(6) : secret);
+    keyBytes = base64ToBytes(secretValue.trim().replace(/^whsec_/, ''));
   } catch {
-    return false;
+    return 'secret_not_base64';
   }
   const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(`${id}.${timestamp}.${payload}`)));
   const expected = enc.encode(bytesToBase64(mac));
-  return signatures.split(' ').some((part) => {
+  const ok = signatures.split(' ').some((part) => {
     const [version, signature] = part.split(',');
     return version === 'v1' && signature && timingSafeEqual(enc.encode(signature), expected);
   });
+  return ok ? '' : 'signature_mismatch';
 }
 
 function recipientAllowed(inbox, data) {
@@ -231,7 +528,10 @@ function recipientAllowed(inbox, data) {
     .filter(Boolean);
   if (!rules.length) return true;
   const addresses = [].concat(data.received_for || [], data.to || [], data.cc || []).map(emailAddress).filter(Boolean);
-  return addresses.some((addr) => rules.some((rule) => (rule.startsWith('@') ? addr.endsWith(rule) : addr === rule)));
+  // "a@b.com" 精确匹配；"@b.com" 或 "b.com" 匹配整个域
+  return addresses.some((addr) =>
+    rules.some((rule) => (rule.includes('@') && !rule.startsWith('@') ? addr === rule : addr.endsWith(`@${rule.replace(/^@/, '')}`))),
+  );
 }
 
 function emailAddress(value) {
@@ -650,14 +950,23 @@ async function handleApi(request, env, url) {
     }
 
     if (path === '/api/delete') {
-      let stmt;
-      if (Number.isInteger(body.id)) stmt = db.prepare('DELETE FROM messages WHERE id = ?').bind(body.id);
-      else if (typeof body.sender === 'string') stmt = db.prepare('DELETE FROM messages WHERE sender = ?').bind(body.sender);
+      let where;
+      let value;
+      if (Number.isInteger(body.id)) [where, value] = ['id = ?', body.id];
+      else if (typeof body.sender === 'string') [where, value] = ['sender = ?', body.sender];
       else return json({ error: 'bad_request' }, 400);
-      await db.batch([stmt, db.prepare(BUMP_VERSION_SQL)]);
+      await db.batch([
+        db.prepare(`INSERT OR IGNORE INTO deleted_emails (email_id) SELECT email_id FROM messages WHERE ${where} AND email_id IS NOT NULL`).bind(value),
+        db.prepare(`DELETE FROM messages WHERE ${where}`).bind(value),
+        db.prepare(BUMP_VERSION_SQL),
+      ]);
       return json({ ok: true });
     }
+
+    if (path === '/api/import') return json(await throttledImport(env, body.force === true));
   }
+
+  if (request.method === 'GET' && path === '/api/diagnostics') return json(await diagnostics(env, url.origin));
 
   return json({ error: 'not_found' }, 404);
 }
@@ -857,6 +1166,12 @@ const ICONS = {
     '<svg viewBox="0 0 20 20" width="20" height="20"><rect class="app" width="20" height="20" rx="4.6"/><path fill="#fff" d="M10 4.4c-3.4 0-6.1 2.2-6.1 4.9 0 1.5.8 2.8 2.1 3.7-.1.9-.6 1.8-1.4 2.4 1.4 0 2.6-.5 3.5-1.3.6.1 1.2.2 1.9.2 3.4 0 6.1-2.2 6.1-5S13.4 4.4 10 4.4Z"/></svg>',
   emptyBubbles:
     '<svg viewBox="0 0 64 64" width="64" height="64" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round"><path d="M27 10c-11.6 0-21 7.6-21 17 0 5.4 3.1 10.2 8 13.3-.4 2.8-1.9 5.6-4.4 7.4 4.6 0 8.8-1.8 11.6-4.5 1.9.5 3.8.8 5.8.8 11.6 0 21-7.6 21-17S38.6 10 27 10Z"/><path d="M51.6 26.5C55.5 29.3 58 33.2 58 37.6c0 4.4-2.4 8.4-6.3 11 .3 2.3 1.6 4.5 3.6 6-3.8 0-7.2-1.5-9.5-3.7-1.5.4-3.1.6-4.8.6-6 0-11.3-2.6-14.2-6.5"/></svg>',
+  pulse:
+    '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2.5-6 4 12 2.5-6H21"/></svg>',
+  stOk: '<svg viewBox="0 0 22 22" width="22" height="22"><circle class="st-ok" cx="11" cy="11" r="11"/><path d="m6.6 11.3 3 3 5.9-6.3" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  stBad: '<svg viewBox="0 0 22 22" width="22" height="22"><circle class="st-bad" cx="11" cy="11" r="11"/><path d="m7.5 7.5 7 7m0-7-7 7" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round"/></svg>',
+  stWarn: '<svg viewBox="0 0 22 22" width="22" height="22"><circle class="st-warn" cx="11" cy="11" r="11"/><path d="M11 6v6.4" fill="none" stroke="#fff" stroke-width="2.3" stroke-linecap="round"/><circle cx="11" cy="15.8" r="1.4" fill="#fff"/></svg>',
+  stIdle: '<svg viewBox="0 0 22 22" width="22" height="22"><circle class="st-idle" cx="11" cy="11" r="11"/><path d="M7 11h8" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round"/></svg>',
   arrowCircle:
     '<svg viewBox="0 0 30 30" width="30" height="30"><circle class="go" cx="15" cy="15" r="15"/><path d="M10 15h10m-4-4.5 4.5 4.5-4.5 4.5" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
 };
@@ -891,6 +1206,7 @@ function appBody() {
         <span class="empty-icon">${ICONS.emptyBubbles}</span>
         <div class="empty-title">暂无信息</div>
         <div id="emptyText" class="empty-text"></div>
+        <button id="emptyDiag" class="empty-btn" type="button">检查连接</button>
       </div>
     </div>
   </section>
@@ -928,7 +1244,8 @@ const BASE_CSS = String.raw`
   color-scheme:light dark;
   --bg:#fff;--bg-2:#f2f2f7;--label:#000;--label-2:rgba(60,60,67,.6);--label-3:rgba(60,60,67,.3);
   --sep:rgba(60,60,67,.29);--fill:rgba(118,118,128,.12);--press:#d1d1d6;--hover:rgba(0,0,0,.035);
-  --blue:#007aff;--red:#ff3b30;--green:#34c759;
+  --blue:#007aff;--red:#ff3b30;--green:#34c759;--orange:#ff9500;
+  --page:#f2f2f7;--cell:#fff;
   --bubble:#e9e9eb;--bubble-hl:#d1d1d6;
   --avatar:linear-gradient(180deg,#a5abb9,#858994);
   --glass:rgba(255,255,255,.6);--glass-solid:#f7f7f8;--glass-rim:rgba(255,255,255,.95);--glass-line:rgba(0,0,0,.07);
@@ -943,7 +1260,8 @@ const BASE_CSS = String.raw`
 @media (prefers-color-scheme:dark){:root{
   --bg:#000;--bg-2:#1c1c1e;--label:#fff;--label-2:rgba(235,235,245,.6);--label-3:rgba(235,235,245,.3);
   --sep:rgba(84,84,88,.6);--fill:rgba(118,118,128,.24);--press:#2c2c2e;--hover:rgba(255,255,255,.05);
-  --blue:#0a84ff;--red:#ff453a;--green:#30d158;
+  --blue:#0a84ff;--red:#ff453a;--green:#30d158;--orange:#ff9f0a;
+  --page:#1c1c1e;--cell:#2c2c2e;
   --bubble:#262628;--bubble-hl:#3a3a3c;
   --avatar:linear-gradient(180deg,#6e6e73,#48484a);
   --glass:rgba(40,40,43,.55);--glass-solid:#1c1c1e;--glass-rim:rgba(255,255,255,.16);--glass-line:rgba(255,255,255,.08);
@@ -1130,6 +1448,36 @@ const APP_CSS = String.raw`
 .sheet-btn.danger{color:var(--red)}
 .sheet-cancel{font-weight:600}
 .sheet-btn:active{background:var(--sheet-hl)}
+
+/* 连接诊断（iOS 页面式表单） */
+.empty-btn{margin-top:18px;min-height:44px;padding:0 18px;color:var(--blue);font-size:.882rem;font-weight:600;letter-spacing:-.016em}
+.page-layer{position:fixed;inset:0;z-index:52}
+.page-scrim{position:absolute;inset:0;background:transparent;transition:background-color .3s ease}
+.page-layer.open .page-scrim{background:var(--scrim)}
+.page-sheet{position:absolute;left:0;right:0;bottom:0;top:calc(env(safe-area-inset-top) + 12px);max-width:640px;margin:0 auto;display:flex;flex-direction:column;background:var(--page);border-radius:26px 26px 0 0;box-shadow:0 -8px 40px rgba(0,0,0,.18);overflow:hidden}
+.page-head{flex:none;position:relative;display:flex;align-items:center;justify-content:center;height:58px;touch-action:none;cursor:grab}
+.page-grabber{position:absolute;top:6px;left:50%;width:36px;height:5px;margin-left:-18px;border-radius:3px;background:var(--label-3)}
+.page-title{margin:0;font-size:1rem;font-weight:600}
+.page-done{position:absolute;right:8px;top:7px;min-height:44px;padding:0 12px;color:var(--blue);font-weight:600}
+.page-body{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding-bottom:calc(env(safe-area-inset-bottom) + 32px)}
+.g-head{margin:22px 32px 7px;font-size:.765rem;color:var(--label-2);letter-spacing:-.006em}
+.g{margin:0 16px;background:var(--cell);border-radius:22px;overflow:hidden}
+.g-row{position:relative;display:flex;align-items:center;gap:12px;width:100%;min-height:46px;padding:11px 16px;text-align:left}
+.g-row + .g-row::before{content:"";position:absolute;top:0;left:16px;right:0;border-top:.5px solid var(--sep)}
+.g-row svg{flex:none}
+.g-main{flex:1;min-width:0;overflow-wrap:anywhere}
+.g-sub{display:block;margin-top:2px;font-size:.765rem;line-height:1.38;color:var(--label-2);letter-spacing:-.006em;overflow-wrap:anywhere}
+.g-value{flex:none;max-width:60%;color:var(--label-2);text-align:right;overflow-wrap:anywhere}
+.g-mono{font-family:ui-monospace,Menlo,monospace;font-size:.8rem;letter-spacing:0}
+.g-foot{margin:7px 32px 0;font-size:.765rem;line-height:1.38;color:var(--label-2);letter-spacing:-.006em}
+.g-action{color:var(--blue)}
+.g-action:disabled{color:var(--label-3)}
+button.g-row:active{background:var(--menu-hl)}
+.g-code{flex:none;min-width:2.6em;padding:2px 6px;border-radius:6px;background:var(--fill);font:600 .765rem/1.3 ui-monospace,Menlo,monospace;text-align:center;color:var(--label-2)}
+.diag-summary{display:flex;gap:12px;align-items:flex-start;margin:6px 16px 0;padding:14px 16px;border-radius:22px;background:var(--cell)}
+.diag-summary b{display:block;font-weight:600}
+.st-ok{fill:var(--green)}.st-bad{fill:var(--red)}.st-warn{fill:var(--orange)}.st-idle{fill:var(--label-3)}
+.diag-loading{padding:40px 16px;text-align:center;color:var(--label-2);font-size:.882rem}
 
 /* 灵动岛式提示 */
 .island{position:fixed;z-index:60;left:50%;top:calc(env(safe-area-inset-top) + 10px);display:flex;align-items:center;gap:10px;min-width:150px;max-width:calc(100vw - 48px);padding:9px 20px 9px 10px;border-radius:999px;background:#000;color:#fff;box-shadow:0 10px 30px rgba(0,0,0,.25);opacity:0;transform:translate(-50%,-14px) scale(.6);pointer-events:none;transition:transform .5s cubic-bezier(.3,1.35,.5,1),opacity .2s ease}
@@ -1414,7 +1762,9 @@ function api(path, body) {
 
 /* ---------- island toast ---------- */
 var islandTimer = 0;
-function toast(title, detail) {
+// 失败时用红色图标，免得「导入失败」配着绿色对勾
+function toast(title, detail, failed) {
+  islandEl.querySelector('.island-icon').innerHTML = failed ? ICONS.stBad : ICONS.check;
   $('islandTitle').textContent = title;
   $('islandDetail').textContent = detail || '';
   islandEl.classList.remove('show');
@@ -1437,9 +1787,9 @@ function fallbackCopy(text) {
 function copyText(text, title) {
   function done() { haptic(); toast(title || '已拷贝', text.length > 24 ? text.slice(0, 24) + '…' : text); }
   if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(text).then(done, function () { if (fallbackCopy(text)) done(); else toast('无法拷贝'); });
+    navigator.clipboard.writeText(text).then(done, function () { if (fallbackCopy(text)) done(); else toast('无法拷贝', '', true); });
   } else if (fallbackCopy(text)) done();
-  else toast('无法拷贝');
+  else toast('无法拷贝', '', true);
 }
 
 /* ---------- conversation list ---------- */
@@ -1670,7 +2020,7 @@ function deleteThread(sender) {
     if (isSplit()) { S.current = null; history.replaceState(null, '', '#/'); renderThreadState(); }
     else goBack();
   }
-  api('/api/delete', { sender: sender }).then(refreshSoon, function () { toast('删除失败'); refreshSoon(); });
+  api('/api/delete', { sender: sender }).then(refreshSoon, function () { toast('删除失败', '', true); refreshSoon(); });
 }
 
 function toggleRead(t) {
@@ -1803,6 +2153,7 @@ $('moreBtn').addEventListener('click', function () {
     source: $('moreBtn'),
     items: [
       { label: '全部标为已读', icon: 'bubble', disabled: !anyUnread, run: markAllRead },
+      { label: '连接诊断', icon: 'pulse', run: openDiagnostics },
       { label: '退出登录', icon: 'logout', run: function () { api('/api/logout', {}).then(function () { location.reload(); }, noop); } }
     ]
   });
@@ -2266,7 +2617,7 @@ function deleteMessage(m) {
       if (!S.messages.length) deleteThreadLocal(sender);
     }
     if (row) collapse(row, finish); else finish();
-    api('/api/delete', { id: m.id }).then(refreshSoon, function () { toast('删除失败'); refreshSoon(); });
+    api('/api/delete', { id: m.id }).then(refreshSoon, function () { toast('删除失败', '', true); refreshSoon(); });
   });
 }
 function deleteThreadLocal(sender) {
@@ -2432,6 +2783,271 @@ function actionSheet(o) {
   });
 }
 
+/* ---------- connection diagnostics ---------- */
+var RESULT_TEXT = {
+  stored: '已保存', duplicate: '重复投递，已忽略', ignored_event: '不是收信事件，已忽略', ignored_recipient: '收件地址不在 INBOX 范围内',
+  invalid_signature: '签名校验失败', invalid_json: '请求内容不是 JSON', resend_api_error: '读取邮件正文失败', not_configured: '配置缺失', error: 'Worker 出错'
+};
+var DETAIL_TEXT = {
+  missing_headers: '缺少签名请求头', stale_timestamp: '时间戳超出 5 分钟', secret_not_base64: 'RESEND_WEBHOOK_SECRET 格式不对',
+  signature_mismatch: 'RESEND_WEBHOOK_SECRET 与 Resend 后台的 Signing secret 不一致'
+};
+function stamp(ts) { return ts ? listTime(ts) + (daysAgo(ts) > 0 ? ' ' + clock(ts) : '') : ''; }
+function verdict(d) {
+  var c = d.config, r = d.resend, w = d.webhooks || [], last = w[0];
+  var setup = d.setup || {}, sw = setup.webhooks, sd = setup.domains;
+  if (c.apiKey === 'missing') return ['bad', 'RESEND_API_KEY 未设置', 'Worker 需要用它读取邮件正文。'];
+  if (c.webhookSecret !== 'ok') return ['bad', 'Webhook 签名密钥有问题', '在 Resend → Webhooks → 你的 Endpoint 里复制 Signing secret（whsec_…），填到 RESEND_WEBHOOK_SECRET。'];
+  if (r && !r.ok) return ['bad', '无法读取 Resend 收件箱', r.error + '。API Key 需要 Full access 权限；401 表示 Key 填错或已删除。'];
+  var emails = r && r.ok ? r.emails : [];
+  var allowed = emails.filter(function (e) { return e.allowed; });
+  var missing = allowed.filter(function (e) { return e.state === 'missing'; }).length;
+  // 先看实际效果：最新一封邮件已入库（或最近一次 Webhook 存进去了）就说明链路是通的，不再拿配置推测吓人
+  var delivering = allowed.length ? allowed[0].state !== 'missing' : !!last && (last.result === 'stored' || last.result === 'duplicate');
+  if (delivering) {
+    return missing
+      ? ['warn', missing + ' 封较早的邮件还没入库', '新邮件已经能正常到达。点下方「从 Resend 导入」把之前漏掉的补上。']
+      : ['ok', '一切正常', '共 ' + d.messages + ' 条信息。新短信会通过 Webhook 实时到达。'];
+  }
+  if (sw && sw.ok) {
+    var subscribed = function (x) { return x.status === 'enabled' && (!x.events || x.events.indexOf('email.received') >= 0); };
+    var mine = sw.items.filter(function (x) { return x.matches; });
+    if (!mine.length) {
+      return sw.items.some(subscribed)
+        ? ['warn', 'Webhook 地址和当前网址不同', '如果它也指向这个 Worker 可以忽略；否则在 Resend → Webhooks 添加 ' + c.webhookUrl + '。']
+        : ['bad', 'Resend 里没有指向这里的 Webhook', '在 Resend → Webhooks 添加 ' + c.webhookUrl + '，事件勾选 email.received。'];
+    }
+    if (!mine.some(subscribed)) {
+      return mine.some(function (x) { return x.status !== 'enabled'; })
+        ? ['bad', 'Webhook 已被停用', '多半是之前连续失败被 Resend 自动停用了。在 Resend → Webhooks 里重新启用，然后点「从 Resend 导入」补回漏掉的。']
+        : ['bad', 'Webhook 没有订阅 email.received', '在 Resend → Webhooks 编辑这个 Endpoint，勾选 email.received 事件。'];
+    }
+  }
+  if (r && r.ok && !emails.length) {
+    var recv = sd && sd.ok ? sd.items.filter(function (x) { return x.receiving === 'enabled'; }) : null;
+    if (recv && !recv.length) return ['bad', '没有开启收信的域名', 'Resend → Domains → 选择域名 → 打开 Receiving，并按提示添加 MX 记录。'];
+    if (recv && recv.every(function (x) { return x.mxRecord && x.mxRecord.status !== 'verified'; })) {
+      return ['warn', '收信 MX 记录还没验证通过', '把 Resend 给出的 MX 记录添加到 ' + recv[0].name + '，且优先级数字要最小，然后等 DNS 生效。'];
+    }
+    var hosts = (recv || []).map(function (x) { return '…@' + x.name; });
+    return ['warn', 'Resend 还没有收到任何邮件', hosts.length
+      ? '手机要转发到 ' + hosts.join(' 或 ') + ' 这样的地址（注意 0901@cuven.us 和 …@0901.cuven.us 是不同的域名）。'
+      : '检查 Resend → Domains 里的收信设置，以及手机转发的收件地址。'];
+  }
+  if (last && last.result === 'invalid_signature') return ['bad', 'Webhook 签名校验失败', (DETAIL_TEXT[last.detail] || last.detail) + '。'];
+  if (last && last.result === 'resend_api_error') return ['bad', '读取邮件正文失败', last.detail];
+  if (emails.length && !allowed.length) return ['warn', 'INBOX 过滤挡掉了所有邮件', '当前 INBOX = ' + c.inbox + '，而邮件发往 ' + emails[0].to + '。清空 INBOX 或改成实际地址。'];
+  if (!w.length) return ['warn', 'Resend 收到了邮件，但从没调用过 Webhook', '在 Resend → Webhooks 添加下面的 Webhook 地址并勾选 email.received。可以先点「从 Resend 导入」。'];
+  if (missing) return ['warn', missing + ' 封邮件还没入库', '点下方「从 Resend 导入」补上。'];
+  return ['ok', '一切正常', '共 ' + d.messages + ' 条信息。新短信会通过 Webhook 实时到达。'];
+}
+function gRow(st, title, sub, value) {
+  var row = el('div', 'g-row');
+  if (st) row.appendChild(icon(st));
+  var main = el('div', 'g-main', title);
+  if (sub) main.appendChild(el('span', 'g-sub', sub));
+  row.appendChild(main);
+  if (value != null) row.appendChild(value.nodeType ? value : el('span', 'g-value', value));
+  return row;
+}
+function varRow(st, title, name, value) {
+  var row = gRow(st, title, null, value);
+  row.querySelector('.g-main').appendChild(el('span', 'g-sub g-mono', name));
+  return row;
+}
+function gSection(body, head, rows, foot) {
+  body.appendChild(el('div', 'g-head', head));
+  var g = el('div', 'g');
+  rows.forEach(function (r) { g.appendChild(r); });
+  body.appendChild(g);
+  if (foot) body.appendChild(el('div', 'g-foot', foot));
+}
+var diagOpen = false;
+function openDiagnostics() {
+  if (diagOpen) return;
+  diagOpen = true;
+  closeMenu(true);
+  var layer = el('div', 'page-layer'), scrim = el('div', 'page-scrim'), sheet = el('div', 'page-sheet');
+  sheet.setAttribute('role', 'dialog'); sheet.setAttribute('aria-modal', 'true'); sheet.setAttribute('aria-label', '连接诊断');
+  var head = el('div', 'page-head'), done = el('button', 'page-done', '完成'), body = el('div', 'page-body');
+  done.type = 'button';
+  head.appendChild(el('span', 'page-grabber')); head.appendChild(el('h2', 'page-title', '连接诊断')); head.appendChild(done);
+  sheet.appendChild(head); sheet.appendChild(body);
+  layer.appendChild(scrim); layer.appendChild(sheet);
+  document.body.appendChild(layer);
+
+  var h = sheet.offsetHeight + 40;
+  var sp = new Spring(function (y) { sheet.style.transform = 'translate3d(0,' + y + 'px,0)'; }, h, 0.5);
+  sp.set(h);
+  requestAnimationFrame(function () { layer.classList.add('open'); sp.to(0, { response: 0.45, damping: 1 }); });
+
+  var prev = document.activeElement, closed = false;
+  app.inert = true; // 表单打开时，后面的页面不可聚焦、不可点
+  done.focus({ preventScroll: true });
+  function close(v) {
+    if (closed) return;
+    closed = true;
+    diagOpen = false;
+    app.inert = false;
+    document.removeEventListener('keydown', onKey, true);
+    layer.classList.remove('open');
+    layer.style.pointerEvents = 'none';
+    sp.to(sheet.offsetHeight + 40, { response: 0.35, damping: 1, velocity: v || 0 }, function () { layer.remove(); });
+    if (prev && prev.focus && document.contains(prev)) prev.focus({ preventScroll: true });
+  }
+  function onKey(e) {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(0); return; }
+    if (e.key === 'Tab') {
+      var items = Array.prototype.slice.call(sheet.querySelectorAll('button:not(:disabled)'));
+      var i = items.indexOf(document.activeElement);
+      e.preventDefault();
+      if (items.length) items[(i + (e.shiftKey ? -1 : 1) + items.length) % items.length].focus();
+      return;
+    }
+    e.stopPropagation(); // 别触发列表页的快捷键
+  }
+  document.addEventListener('keydown', onKey, true);
+  done.addEventListener('click', function () { close(0); });
+  scrim.addEventListener('click', function () { close(0); });
+
+  // 下拉抓手关闭，跟手并继承速度
+  var g = null;
+  head.addEventListener('pointerdown', function (e) {
+    if (e.target === done) return;
+    sp.stop();
+    g = { y: e.clientY, base: sp.x, id: e.pointerId, tr: new Tracker() };
+    g.tr.add(e.clientY, e.timeStamp);
+    try { head.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  head.addEventListener('pointermove', function (e) {
+    if (!g || e.pointerId !== g.id) return;
+    g.tr.add(e.clientY, e.timeStamp);
+    var y = g.base + e.clientY - g.y;
+    sp.x = y < 0 ? -rubber(-y, 400) : y;
+    sp.apply(sp.x);
+  });
+  function release(e) {
+    if (!g || e.pointerId !== g.id) return;
+    g.tr.add(e.clientY, e.timeStamp);
+    var v = g.tr.velocity();
+    g = null;
+    if (sp.x + project(v) > sheet.offsetHeight * 0.35) close(Math.max(v, 0));
+    else sp.to(0, { response: 0.4, damping: 1, velocity: v });
+  }
+  head.addEventListener('pointerup', release);
+  head.addEventListener('pointercancel', release);
+
+  function load() {
+    body.textContent = '';
+    body.appendChild(el('div', 'diag-loading', '正在检查…'));
+    api('/api/diagnostics').then(render, function (err) {
+      body.textContent = '';
+      body.appendChild(el('div', 'diag-loading', '检查失败：' + err.message));
+    });
+  }
+  function render(d) {
+    if (closed) return;
+    body.textContent = '';
+    var c = d.config, r = d.resend, w = d.webhooks || [], v = verdict(d);
+    var sum = el('div', 'diag-summary');
+    sum.appendChild(icon(v[0] === 'ok' ? 'stOk' : v[0] === 'bad' ? 'stBad' : 'stWarn'));
+    var st = el('div', 'g-main');
+    st.appendChild(el('b', null, v[1]));
+    st.appendChild(el('span', 'g-sub', v[2]));
+    sum.appendChild(st);
+    body.appendChild(sum);
+
+    var urlRow = el('button', 'g-row');
+    urlRow.type = 'button';
+    var urlMain = el('div', 'g-main', 'Webhook 地址');
+    urlMain.appendChild(el('span', 'g-sub g-mono', c.webhookUrl));
+    urlRow.appendChild(urlMain);
+    urlRow.appendChild(el('span', 'g-value g-action', '拷贝'));
+    urlRow.addEventListener('click', function () { copyText(c.webhookUrl, '已拷贝地址'); });
+    gSection(body, '配置', [
+      varRow(c.apiKey === 'ok' ? 'stOk' : c.apiKey === 'missing' ? 'stBad' : 'stWarn', 'API Key', 'RESEND_API_KEY', c.apiKey === 'ok' ? '已设置' : c.apiKey === 'missing' ? '未设置' : '格式不对'),
+      varRow(c.webhookSecret === 'ok' ? 'stOk' : 'stBad', 'Webhook 签名密钥', 'RESEND_WEBHOOK_SECRET', c.webhookSecret === 'ok' ? '格式正确' : c.webhookSecret === 'missing' ? '未设置' : '格式不对'),
+      varRow(null, '收件地址过滤', 'INBOX', c.inbox || '不限'),
+      varRow(null, '时区', 'TZ_OFFSET', c.tz),
+      urlRow
+    ], '在 Resend → Webhooks 添加这个地址，事件勾选 email.received。');
+
+    var inbox = [];
+    if (!r) inbox.push(gRow('stBad', '无法读取', '没有设置 RESEND_API_KEY'));
+    else if (!r.ok) inbox.push(gRow('stBad', '读取失败', r.error));
+    else if (!r.emails.length) inbox.push(gRow('stWarn', 'Resend 还没有收到任何邮件', '检查域名收信设置和 MX 记录'));
+    else r.emails.forEach(function (e) {
+      var st = !e.allowed || e.state === 'deleted' ? 'stIdle' : e.state === 'stored' ? 'stOk' : 'stBad';
+      var state = !e.allowed ? '已跳过' : { stored: '已入库', deleted: '已删除', missing: '未入库' }[e.state];
+      inbox.push(gRow(st, e.subject || '（无主题）', e.to + (e.at ? ' · ' + stamp(e.at) : ''), state));
+    });
+    if (r && r.ok) {
+      var imp = el('button', 'g-row g-action', '从 Resend 导入');
+      imp.type = 'button';
+      imp.addEventListener('click', function () {
+        imp.disabled = true; imp.textContent = '正在导入…';
+        var total = 0, rounds = 0, errors = [];
+        // 一次请求最多补 25 封，没补完（more）就接着要
+        (function step() {
+          api('/api/import', { force: true }).then(function (res) {
+            if (!res.ok) { done(res.error); return; }
+            total += res.imported || 0;
+            errors = errors.concat(res.errors || []);
+            imp.textContent = '正在导入…（已导入 ' + total + ' 条）';
+            if (res.more && (res.imported || !errors.length) && ++rounds < 40) step();
+            else done();
+          }, function (err) { done(err.message); });
+        })();
+        function done(failure) {
+          if (failure) toast('导入失败', failure, true);
+          else if (total) toast('已导入 ' + total + ' 条', errors[0] || '');
+          else if (errors.length) toast('导入失败', errors[0], true);
+          else toast('没有需要导入的邮件');
+          refreshSoon();
+          load();
+        }
+      });
+      inbox.push(imp);
+    }
+    gSection(body, 'Resend 收件箱（最近 10 封）', inbox, '「未入库」表示 Resend 收到了，但 Webhook 没有成功送达。');
+
+    var setup = d.setup;
+    if (setup) {
+      var rows = [];
+      if (!setup.webhooks.ok) rows.push(gRow('stBad', 'Webhooks 读取失败', setup.webhooks.error));
+      else if (!setup.webhooks.items.length) rows.push(gRow('stBad', '还没有创建 Webhook', null));
+      else setup.webhooks.items.forEach(function (x) {
+        var subscribed = !x.events || x.events.indexOf('email.received') >= 0;
+        var good = x.matches && x.status === 'enabled' && subscribed;
+        var note = x.status !== 'enabled' ? '已停用' : !subscribed ? '未勾选 email.received' : !x.matches ? '不是这个网址' : '正常';
+        var row = gRow(good ? 'stOk' : x.matches ? 'stBad' : 'stIdle', 'Webhook', null, note);
+        row.querySelector('.g-main').appendChild(el('span', 'g-sub g-mono', x.endpoint));
+        rows.push(row);
+      });
+      if (!setup.domains.ok) rows.push(gRow('stBad', '域名读取失败', setup.domains.error));
+      else if (!setup.domains.items.length) rows.push(gRow('stBad', '还没有添加域名', null));
+      else setup.domains.items.forEach(function (x) {
+        var on = x.receiving === 'enabled';
+        var mxOk = x.mxRecord && x.mxRecord.status === 'verified';
+        var dns = x.dns == null ? 'MX 查询失败' : x.dns.length ? 'MX → ' + x.dns.map(function (m) { return m.priority + ' ' + m.host; }).join('，') : '没有 MX 记录';
+        var sub = (on ? '收件地址：…@' + x.name + ' · ' : '') + (x.mxRecord ? '收信记录 ' + x.mxRecord.status + ' · ' : '') + dns;
+        rows.push(gRow(!on ? 'stIdle' : mxOk ? 'stOk' : 'stWarn', x.name, sub, on ? '收信已开启' : '未开启收信'));
+      });
+      gSection(body, 'Resend 设置', rows, '只有开启收信、MX 指向 Resend 的域名才能收到邮件。');
+    }
+
+    var hooks = w.length ? w.map(function (x) {
+      var code = el('span', 'g-code', String(x.status));
+      var row = gRow(null, RESULT_TEXT[x.result] || x.result, (x.detail ? (DETAIL_TEXT[x.detail] || x.detail) + ' · ' : '') + stamp(x.at));
+      row.insertBefore(code, row.firstChild);
+      return row;
+    }) : [gRow('stIdle', '还没有收到过 Webhook 请求', '检查 Resend 里的 Webhook 地址和事件')];
+    gSection(body, 'Webhook 请求（最近 20 次）', hooks);
+  }
+  load();
+}
+$('emptyDiag').addEventListener('click', openDiagnostics);
+
 /* ---------- keyboard ---------- */
 document.addEventListener('keydown', function (e) {
   if (e.key === 'Escape') {
@@ -2469,8 +3085,12 @@ function poll() {
     if (r.version !== S.version) return refresh();
   }).catch(noop).then(function () { pollTimer = setTimeout(poll, POLL_MS); });
 }
+// Webhook 漏掉的邮件：打开页面时向 Resend 补拉一次（服务端限流）
+function autoImport() {
+  api('/api/import', {}).then(function (r) { if (r.imported) refreshSoon(); }, noop);
+}
 document.addEventListener('visibilitychange', function () {
-  if (document.visibilityState === 'visible') { poll(); maybeMarkRead(); }
+  if (document.visibilityState === 'visible') { poll(); maybeMarkRead(); autoImport(); }
   else clearTimeout(pollTimer);
 });
 
@@ -2482,7 +3102,7 @@ refresh().then(function () {
     if (!isSplit()) { history.replaceState(null, '', '#/'); history.pushState({ t: sender }, '', threadUrl(sender)); S.pushed = true; }
     openThread(sender, { history: false, animate: false });
   }
-}, noop).then(function () { pollTimer = setTimeout(poll, POLL_MS); });
+}, noop).then(function () { pollTimer = setTimeout(poll, POLL_MS); autoImport(); });
 })();
 `;
 
@@ -2495,4 +3115,4 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180">
 const APPLE_TOUCH_ICON_B64 = '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';
 
 // 供单元测试使用（Worker 运行时只使用 default 导出）
-export { parseSms, parseSmsTime, extractCode, messageFromEmail, verifyWebhookSignature, recipientAllowed, normalizeSender, htmlToText };
+export { parseSms, parseSmsTime, extractCode, messageFromEmail, verifyWebhookSignature, webhookSignatureProblem, webhookSecretState, recipientAllowed, normalizeSender, htmlToText, secret };
